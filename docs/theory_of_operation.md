@@ -10,7 +10,8 @@ Elite RAG follows six invariants:
    and deeper fallback search, not duplicate windows.
 3. Retrieval metadata participates twice: compact metadata is embedded into child text,
    while rich metadata remains independently filterable in Qdrant.
-4. Child vectors select evidence; parent text is what the reranker and generator read.
+4. Dense and sparse child vectors jointly select evidence; parent text is what the reranker and
+   generator read.
 5. Retrieval is bounded and inspectable. One primary pass and no more than one corrective
    pass are allowed.
 6. Missing evidence produces an explicit abstention instruction rather than an invitation
@@ -36,7 +37,7 @@ The chunker computes budgets with the embedding model's tokenizer. Parent groupi
 child splitting are separate operations:
 
 - parents preserve enough neighboring evidence for distant facts and reranking;
-- children remain narrow enough for high-resolution dense matching;
+- children remain narrow enough for high-resolution dense and sparse matching;
 - a child points to exactly one parent;
 - a parent belongs to exactly one source document.
 
@@ -47,7 +48,7 @@ to adjacent chunks nor silently discarded.
 ### 4. Embed and persist
 
 The ingestion engine batches child inputs, embeds them, and upserts Qdrant points. Normal
-reruns overwrite deterministic IDs. `--replace-existing` first deletes all points for a
+reruns overwrite deterministic IDs. The API's `replace_existing` option first deletes all points for a
 document, which also removes stale tail chunks after a document becomes shorter. Because
 that mode is delete-then-upsert, operators should use it only when source data can be
 replayed after interruption.
@@ -57,19 +58,22 @@ replayed after interruption.
 ```text
 query
   -> parse source/project intent
-  -> query embedding
-  -> filtered top-25 child search
+  -> dense EmbeddingGemma + sparse miniCOIL query representations
+  -> filtered Qdrant dense/sparse prefetches
+  -> native Qdrant RRF fusion
+  -> hybrid candidate window, then outer retrieval limit
   -> collapse unique parents
   -> rerank parent text
        | score >= threshold -> return
        | score < threshold  -> simplify query
-       |                      -> filtered top-50 child search
+       |                      -> wider filtered hybrid child search
        |                      -> collapse + rerank -> return
        | Jina unavailable    -> preserve vector order -> return
   -> compile evidence prompt
   -> stream generation tokens
 ```
 
+Both prefetches use the same active metadata filters and Qdrant fuses their rankings with RRF.
 The fallback keeps active metadata filters. An explicit user constraint is therefore
 never silently relaxed. If an organization uses implicit aliases that are too broad or
 too narrow, adjust `configs/filter_aliases.json` rather than allowing semantic search to
@@ -105,7 +109,7 @@ document IDs alongside answers for audit and evaluation.
 | Malformed benchmark field declarations | ingestion stops with `DocumentFormatError` |
 | Empty parsed document | skipped and counted in the ingestion report |
 | Embedding or Qdrant failure | current operation fails; deterministic IDs permit replay |
-| No primary Qdrant matches | corrective pass runs with the same hard filters |
+| No primary Qdrant matches | corrective hybrid pass runs with the same hard filters |
 | Jina transport or response failure | vector-ranked parents are returned |
 | Local LLM failure before streaming | caller receives the OpenAI client error |
 | LLM failure after streaming begins | stream terminates; clients must treat it as partial |

@@ -2,8 +2,9 @@
 
 Elite RAG is an API-first parent-child enterprise retrieval system for the
 [EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench) corpus.
-It uses local EmbeddingGemma embeddings, Qdrant, a local Jina reranker, Qwen generation,
-and Llama 3.1 scoring through OpenAI-compatible services.
+It uses local EmbeddingGemma dense embeddings, Qdrant native hybrid retrieval with miniCOIL
+sparse vectors and reciprocal-rank fusion (RRF), a local Jina reranker, Qwen generation, and
+Llama 3.1 scoring through OpenAI-compatible services.
 
 ## Run the server
 
@@ -15,6 +16,11 @@ uv run uvicorn elite_rag.api:app --host 0.0.0.0 --port 8080
 
 Open [Swagger UI](http://localhost:8080/docs) to use and inspect every endpoint.
 See [the API reference](docs/api.md) for request/response contracts and processing behavior.
+
+Qdrant stores two named vectors for each child chunk: the normalized EmbeddingGemma dense vector
+(`dense`) and a miniCOIL sparse vector (`sparse`). Queries retrieve candidates from both indexes
+using native Qdrant prefetch clauses, and Qdrant fuses the rankings with RRF before Jina
+reranking. The configured hybrid candidate window is `HYBRID_CANDIDATE_LIMIT` (default `100`).
 
 ## API operations
 

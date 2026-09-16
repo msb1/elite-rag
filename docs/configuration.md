@@ -22,6 +22,11 @@ Qdrant's `IDF` modifier. Changing vector names, the embedding dimension, or the 
 schema requires a compatible collection. Never recreate a production collection without a
 backup and a replayable source corpus.
 
+The `qdrant-client[fastembed]` extra is required. It lets the Python client download and run
+Qdrant's miniCOIL model through `models.Document` during point upserts and query construction.
+Dense and sparse vectors are fused inside Qdrant with reciprocal-rank fusion (RRF), so the
+application does not perform a second search or merge rankings in Python.
+
 ## Embedding and chunking
 
 | Variable | Default | Meaning |

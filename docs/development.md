@@ -12,7 +12,9 @@ uv run pytest -q
 Tests cover declared-field loading, Markdown/HTML/email/Slack topology, fenced-code
 handling, token ceilings, zero-overlap ordering, stable IDs, alias expansion, fallback
 normalization, parent deduplication, corrective-pass bounds, reranker outage behavior,
-prompt escaping, Qdrant payloads, and native filters.
+prompt escaping, Qdrant payloads, native filters, and native dense/miniCOIL hybrid search
+with RRF fusion. Run `uv sync` so the `qdrant-client[fastembed]` extra is installed before
+testing FastEmbed-backed behavior.
 
 ## Adding a source type
 
@@ -39,4 +41,3 @@ one collection.
 Record the git revision, environment configuration excluding secrets, embedding model,
 reranker model, generation model, and Qdrant collection for every benchmark run. Tune on
 a development subset and reserve held-out questions for final evaluation.
-

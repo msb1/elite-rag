@@ -10,7 +10,8 @@
 | 150-token children | tokenizer-aware complete vector input ceiling | Implemented |
 | 2,000-token parents | tokenizer-aware parent ceiling; long documents form several parents | Implemented |
 | Forced metadata injection | title, source, project, date, section precede child text | Implemented |
-| Child vectors in Qdrant | normalized EmbeddingGemma vectors | Implemented |
+| Child vectors in Qdrant | named normalized EmbeddingGemma dense vectors plus miniCOIL sparse vectors | Implemented |
+| Native hybrid retrieval | Qdrant dense/sparse prefetches with native RRF fusion | Implemented |
 | Parent payload/docstore | parent context stored directly in each child payload | Implemented in payload mode |
 | Native Qdrant filters | indexed source, project, date, document, and parent fields | Implemented |
 | Parent deduplication | ordered collapse by parent ID | Implemented |
@@ -37,6 +38,8 @@ This review produced the following changes:
   Linear candidates.
 - Removed explicit `source:` and `project:` syntax from corrective embedding text while
   preserving the corresponding hard Qdrant filter.
+- Added Qdrant FastEmbed miniCOIL sparse vectors, collection-level IDF configuration, and native
+  dense/sparse RRF fusion for primary and corrective retrieval passes.
 - Added this documentation set and linked it from the project README.
 - Added direct-to-RustFS archive upload and remote-object ingestion so the corpus need not
   be stored on the local computer.
