@@ -1,0 +1,25 @@
+{
+  "sources": {
+    "chat": "slack",
+    "confluence": "confluence",
+    "drive": "google_drive",
+    "email": "gmail",
+    "fireflies": "fireflies",
+    "github": "github",
+    "gmail": "gmail",
+    "hubspot": "hubspot",
+    "jira": "jira",
+    "linear": "linear",
+    "mail": "gmail",
+    "meeting": "fireflies",
+    "pull request": "github",
+    "slack": "slack",
+    "ticket": ["jira", "linear"],
+    "wiki": "confluence"
+  },
+  "projects": {
+    "devops": "devops",
+    "hydra": "hydra",
+    "sre": "sre"
+  }
+}

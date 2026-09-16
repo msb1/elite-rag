@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import pytest
+from qdrant_client import QdrantClient, models
+
+from elite_rag.models import ChildChunk
+from elite_rag.vector_store import QdrantVectorStore, SearchFilter
+
+
+def test_qdrant_payload_and_native_filters() -> None:
+    store = QdrantVectorStore(
+        "http://unused", "test", 4, client=QdrantClient(":memory:"), hybrid_enabled=False
+    )
+    with pytest.warns(UserWarning, match="Payload indexes have no effect"):
+        report = store.ensure_collection()
+    assert report.created
+    assert not report.recreated
+    assert "metadata_filters.source" in report.indexed_fields
+    chunk = ChildChunk(
+        child_id="00000000-0000-0000-0000-000000000001",
+        parent_id="parent-1",
+        document_id="doc-1",
+        text="child",
+        vector_text="embedded child",
+        metadata={
+            "source": "jira",
+            "project_id": "hydra",
+            "last_modified": "2026-09-01",
+            "labels": ["incident", "security"],
+            "_parent_context": "complete parent",
+        },
+    )
+    store.upsert([chunk], [[1.0, 0.0, 0.0, 0.0]])
+
+    hits = store.search(
+        [1.0, 0.0, 0.0, 0.0],
+        "embedded child",
+        SearchFilter(sources=("jira",), projects=("hydra",)),
+        5,
+    )
+    assert len(hits) == 1
+    assert hits[0].payload["parent_context"] == "complete parent"
+    assert hits[0].payload["metadata_filters"]["labels"] == ["incident", "security"]
+
+    misses = store.search(
+        [1.0, 0.0, 0.0, 0.0], "embedded child", SearchFilter(sources=("slack",)), 5
+    )
+    assert misses == []
+
+
+class CapturingClient:
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, object] = {}
+        self.upsert_points: list[models.PointStruct] = []
+        self.query_kwargs: dict[str, object] = {}
+
+    def collection_exists(self, collection_name: str) -> bool:
+        return False
+
+    def create_collection(self, **kwargs: object) -> None:
+        self.create_kwargs = kwargs
+
+    def create_payload_index(self, **kwargs: object) -> None:
+        return None
+
+    def upsert(self, **kwargs: object) -> None:
+        self.upsert_points = list(kwargs["points"])  # type: ignore[arg-type]
+
+    def query_points(self, **kwargs: object) -> object:
+        self.query_kwargs = kwargs
+        return type("Result", (), {"points": []})()
+
+
+def test_hybrid_store_uses_named_dense_and_minicoil_sparse_vectors() -> None:
+    client = CapturingClient()
+    store = QdrantVectorStore("http://unused", "hybrid", 4, client=client)
+    store.ensure_collection()
+    assert set(client.create_kwargs["vectors_config"]) == {"dense"}  # type: ignore[arg-type]
+    sparse_config = client.create_kwargs["sparse_vectors_config"]  # type: ignore[assignment]
+    assert sparse_config["sparse"].modifier == models.Modifier.IDF  # type: ignore[index,union-attr]
+
+    chunk = ChildChunk(
+        child_id="00000000-0000-0000-0000-000000000001",
+        parent_id="parent-1",
+        document_id="doc-1",
+        text="child",
+        vector_text="title: ticket | source: jira | ACME-404",
+        metadata={"source": "jira", "_parent_context": "complete parent"},
+    )
+    store.upsert([chunk], [[1.0, 0.0, 0.0, 0.0]])
+    point_vectors = client.upsert_points[0].vector
+    assert point_vectors["dense"] == [1.0, 0.0, 0.0, 0.0]  # type: ignore[index]
+    assert point_vectors["sparse"].model == "Qdrant/minicoil-v1"  # type: ignore[index,union-attr]
+
+    store.search([1.0, 0.0, 0.0, 0.0], "What is ACME-404?", None, 25)
+    prefetch = client.query_kwargs["prefetch"]
+    assert len(prefetch) == 2  # type: ignore[arg-type]
+    assert client.query_kwargs["query"].fusion == models.Fusion.RRF  # type: ignore[union-attr]
+    assert client.query_kwargs["limit"] == 100

@@ -57,6 +57,7 @@ cover/
 
 # Django stuff:
 *.log
+logs/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -216,3 +217,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.DS_Store
+answer_evaluation/*.jsonl
+data/
+models/
