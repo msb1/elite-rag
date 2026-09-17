@@ -4,7 +4,16 @@ import pytest
 from qdrant_client import QdrantClient, models
 
 from elite_rag.models import ChildChunk
+from elite_rag.sparse_embedding import SparseVector
 from elite_rag.vector_store import QdrantVectorStore, SearchFilter
+
+
+class FakeSparseEmbedder:
+    def embed_documents(self, texts: list[str]) -> list[SparseVector]:
+        return [SparseVector(indices=[1, 2], values=[0.5, 1.0]) for _ in texts]
+
+    def embed_query(self, text: str) -> SparseVector:
+        return SparseVector(indices=[1, 2], values=[0.5, 1.0])
 
 
 def test_qdrant_payload_and_native_filters() -> None:
@@ -73,7 +82,9 @@ class CapturingClient:
 
 def test_hybrid_store_uses_named_dense_and_minicoil_sparse_vectors() -> None:
     client = CapturingClient()
-    store = QdrantVectorStore("http://unused", "hybrid", 4, client=client)
+    store = QdrantVectorStore(
+        "http://unused", "hybrid", 4, client=client, sparse_embedder=FakeSparseEmbedder()  # type: ignore[arg-type]
+    )
     store.ensure_collection()
     assert set(client.create_kwargs["vectors_config"]) == {"dense"}  # type: ignore[arg-type]
     sparse_config = client.create_kwargs["sparse_vectors_config"]  # type: ignore[assignment]
@@ -90,10 +101,12 @@ def test_hybrid_store_uses_named_dense_and_minicoil_sparse_vectors() -> None:
     store.upsert([chunk], [[1.0, 0.0, 0.0, 0.0]])
     point_vectors = client.upsert_points[0].vector
     assert point_vectors["dense"] == [1.0, 0.0, 0.0, 0.0]  # type: ignore[index]
-    assert point_vectors["sparse"].model == "Qdrant/minicoil-v1"  # type: ignore[index,union-attr]
+    assert point_vectors["sparse"].indices == [1, 2]  # type: ignore[index,union-attr]
+    assert point_vectors["sparse"].values == [0.5, 1.0]  # type: ignore[index,union-attr]
 
     store.search([1.0, 0.0, 0.0, 0.0], "What is ACME-404?", None, 25)
     prefetch = client.query_kwargs["prefetch"]
     assert len(prefetch) == 2  # type: ignore[arg-type]
     assert client.query_kwargs["query"].fusion == models.Fusion.RRF  # type: ignore[union-attr]
     assert client.query_kwargs["limit"] == 100
+    assert prefetch[1].query.indices == [1, 2]  # type: ignore[index,union-attr]

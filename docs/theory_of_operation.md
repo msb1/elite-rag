@@ -41,9 +41,10 @@ child splitting are separate operations:
 - a child points to exactly one parent;
 - a parent belongs to exactly one source document.
 
-When a single sentence exceeds a budget, whitespace units are used as the final lossless
-semantic fallback. Formatting whitespace may be normalized, but words are neither copied
-to adjacent chunks nor silently discarded.
+When a single sentence exceeds a budget, whitespace units are used first. If a URL, hash,
+identifier, or code-like unit has no whitespace and exceeds the budget, the chunker uses a
+tokenizer-aware character split as the final lossless fallback. Formatting whitespace may be
+normalized, but source characters are neither copied to adjacent chunks nor silently discarded.
 
 ### 4. Embed and persist
 
@@ -106,7 +107,8 @@ document IDs alongside answers for audit and evaluation.
 
 | Failure | Behavior |
 | --- | --- |
-| Malformed benchmark field declarations | ingestion stops with `DocumentFormatError` |
+| Malformed benchmark field declarations | affected document is recorded and skipped when the loader can identify the object |
+| Oversized whitespace-free token | token-aware character splitting preserves the document and chunk budget |
 | Empty parsed document | skipped and counted in the ingestion report |
 | Embedding or Qdrant failure | current operation fails; deterministic IDs permit replay |
 | No primary Qdrant matches | corrective hybrid pass runs with the same hard filters |

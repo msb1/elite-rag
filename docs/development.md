@@ -13,8 +13,8 @@ Tests cover declared-field loading, Markdown/HTML/email/Slack topology, fenced-c
 handling, token ceilings, zero-overlap ordering, stable IDs, alias expansion, fallback
 normalization, parent deduplication, corrective-pass bounds, reranker outage behavior,
 prompt escaping, Qdrant payloads, native filters, and native dense/miniCOIL hybrid search
-with RRF fusion. Run `uv sync` so the `qdrant-client[fastembed]` extra is installed before
-testing FastEmbed-backed behavior.
+with RRF fusion. Elite RAG itself has no FastEmbed dependency; use the separate
+`services/minicoil_service` project when developing or deploying sparse inference.
 
 ## Adding a source type
 

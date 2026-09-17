@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from elite_rag.models import ChildChunk
+from elite_rag.sparse_embedding import MiniCOILSparseEmbedder, SparseVector
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class CollectionSchemaError(ValueError):
 
 
 class QdrantVectorStore:
-    """Hybrid Qdrant store with EmbeddingGemma dense vectors and miniCOIL sparse vectors."""
+    """Hybrid Qdrant store with dense vectors and remote miniCOIL sparse vectors."""
 
     def __init__(
         self,
@@ -46,7 +46,7 @@ class QdrantVectorStore:
         *,
         dense_vector_name: str = "dense",
         sparse_vector_name: str = "sparse",
-        sparse_model: str = "Qdrant/minicoil-v1",
+        sparse_embedder: MiniCOILSparseEmbedder | None = None,
         hybrid_candidate_limit: int = 100,
         hybrid_enabled: bool = True,
     ) -> None:
@@ -62,7 +62,7 @@ class QdrantVectorStore:
         self.vector_size = vector_size
         self.dense_vector_name = dense_vector_name
         self.sparse_vector_name = sparse_vector_name
-        self.sparse_model = sparse_model
+        self.sparse_embedder = sparse_embedder
         self.hybrid_candidate_limit = hybrid_candidate_limit
         self.hybrid_enabled = hybrid_enabled
 
@@ -137,15 +137,16 @@ class QdrantVectorStore:
         )
 
     def upsert(self, chunks: Sequence[ChildChunk], vectors: Sequence[Sequence[float]]) -> None:
-        from qdrant_client.models import Document, PointStruct
+        from qdrant_client.models import PointStruct
+        from qdrant_client.models import SparseVector as QdrantSparseVector
 
         if len(chunks) != len(vectors):
             raise ValueError("Every child chunk must have exactly one dense vector")
-        average_length = _average_document_length(chunk.vector_text for chunk in chunks)
+        sparse_vectors = self._embed_sparse_documents(chunks)
         points = [
             PointStruct(
                 id=chunk.child_id,
-                vector=self._point_vectors(vector, chunk.vector_text, average_length, Document),
+                vector=self._point_vectors(vector, sparse_vector, QdrantSparseVector),
                 payload={
                     "document_id": chunk.document_id,
                     "parent_id": chunk.parent_id,
@@ -159,14 +160,13 @@ class QdrantVectorStore:
                     },
                 },
             )
-            for chunk, vector in zip(chunks, vectors, strict=True)
+            for chunk, vector, sparse_vector in zip(chunks, vectors, sparse_vectors, strict=True)
         ]
         if points:
             LOGGER.info(
-                "qdrant_upsert_started collection=%s points=%s sparse_avg_len=%.2f",
+                "qdrant_upsert_started collection=%s points=%s",
                 self.collection_name,
                 len(points),
-                average_length,
             )
             try:
                 self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
@@ -228,10 +228,12 @@ class QdrantVectorStore:
             )
             return points
 
-        from qdrant_client.models import Document, Fusion, FusionQuery, Prefetch
+        from qdrant_client.models import Fusion, FusionQuery, Prefetch
+        from qdrant_client.models import SparseVector as QdrantSparseVector
 
         candidate_limit = max(limit, self.hybrid_candidate_limit)
         query_filter = self._to_qdrant_filter(search_filter)
+        sparse_query = self._embed_sparse_query(query_text)
         result = self.client.query_points(
             collection_name=self.collection_name,
             prefetch=[
@@ -242,7 +244,10 @@ class QdrantVectorStore:
                     limit=candidate_limit,
                 ),
                 Prefetch(
-                    query=Document(text=query_text, model=self.sparse_model),
+                    query=QdrantSparseVector(
+                        indices=sparse_query.indices,
+                        values=sparse_query.values,
+                    ),
                     using=self.sparse_vector_name,
                     filter=query_filter,
                     limit=candidate_limit,
@@ -277,18 +282,39 @@ class QdrantVectorStore:
             )
 
     def _point_vectors(
-        self, vector: Sequence[float], text: str, average_length: float, document: Any
+        self,
+        vector: Sequence[float],
+        sparse_vector: SparseVector | None,
+        qdrant_sparse_vector: Any,
     ) -> Any:
         if not self.hybrid_enabled:
             return list(vector)
+        if sparse_vector is None:
+            raise RuntimeError("A sparse vector is required for hybrid indexing")
         return {
             self.dense_vector_name: list(vector),
-            self.sparse_vector_name: document(
-                text=text,
-                model=self.sparse_model,
-                options={"avg_len": average_length},
+            self.sparse_vector_name: qdrant_sparse_vector(
+                indices=sparse_vector.indices,
+                values=sparse_vector.values,
             ),
         }
+
+    def _embed_sparse_documents(self, chunks: Sequence[ChildChunk]) -> list[SparseVector | None]:
+        if not self.hybrid_enabled:
+            return [None] * len(chunks)
+        if self.sparse_embedder is None:
+            raise RuntimeError("A remote miniCOIL sparse embedder is required for hybrid indexing")
+        return [
+            sparse_vector
+            for sparse_vector in self.sparse_embedder.embed_documents(
+                [chunk.vector_text for chunk in chunks]
+            )
+        ]
+
+    def _embed_sparse_query(self, query_text: str) -> SparseVector:
+        if self.sparse_embedder is None:
+            raise RuntimeError("A remote miniCOIL sparse embedder is required for hybrid retrieval")
+        return self.sparse_embedder.embed_query(query_text)
 
     @staticmethod
     def _to_qdrant_filter(search_filter: SearchFilter | None) -> Any:
@@ -312,8 +338,3 @@ class QdrantVectorStore:
                 )
             )
         return Filter(must=conditions)
-
-
-def _average_document_length(texts: Sequence[str] | Any) -> float:
-    lengths = [len(re.findall(r"\w+", text, flags=re.UNICODE)) for text in texts]
-    return max(sum(lengths) / len(lengths), 1.0) if lengths else 1.0

@@ -1,0 +1,32 @@
+[project]
+name = "elite-rag-remote-models"
+version = "0.1.0"
+description = "Combined remote Jina Reranker v3.5 and miniCOIL FastAPI service"
+readme = "remote-models.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "fastembed>=0.7,<1",
+  "psutil>=6,<8",
+  "python-dotenv>=1.0,<2",
+  "torch>=2.9,<2.11",
+  "transformers>=4.49,<5",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+# CUDA 13-capable NVIDIA drivers are backward-compatible with this CUDA 12.6
+# PyTorch runtime. The explicit source avoids resolving a CPU-only torch wheel.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

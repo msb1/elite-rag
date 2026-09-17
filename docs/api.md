@@ -153,7 +153,7 @@ Processing steps:
    `RawDocument` using the first line as title.
 5. Ensures the Qdrant collection and indexes exist.
 6. Uses the source-aware parser, creates zero-overlap child chunks and bounded parent contexts,
-   requests EmbeddingGemma dense vectors, asks FastEmbed to create miniCOIL sparse vectors, and
+   requests EmbeddingGemma dense vectors and the remote miniCOIL service's sparse vectors, then
    upserts named dense/sparse child vectors into Qdrant.
 
 Response `202 Accepted`:
@@ -356,7 +356,7 @@ Processing steps:
 
 1. Extracts any deterministic natural-language filters from the query.
 2. Applies explicit request filters as hard source/project constraints.
-3. Embeds the query with local EmbeddingGemma and FastEmbed miniCOIL.
+3. Embeds the query with remote EmbeddingGemma and remote miniCOIL services.
 4. Runs Qdrant dense and sparse prefetches, fuses the configured candidate rankings natively with
    RRF, and collapses matching child vectors into unique parent contexts.
 5. Calls the local Jina reranker at `JINA_RERANK_URL`.

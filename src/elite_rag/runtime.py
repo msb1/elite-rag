@@ -12,6 +12,7 @@ from elite_rag.missing_documents import MissingDocumentRecorder
 from elite_rag.parsing import default_registry
 from elite_rag.reranking import JinaReranker
 from elite_rag.retrieval import TwoPassDeterministicRetriever
+from elite_rag.sparse_embedding import MiniCOILSparseEmbedder
 from elite_rag.vector_store import QdrantVectorStore
 
 
@@ -36,7 +37,12 @@ def build_runtime(settings: Settings) -> Runtime:
         settings.qdrant_api_key,
         dense_vector_name=settings.qdrant_dense_vector_name,
         sparse_vector_name=settings.qdrant_sparse_vector_name,
-        sparse_model=settings.sparse_embedding_model,
+        sparse_embedder=MiniCOILSparseEmbedder(
+            settings.sparse_embedding_url,
+            settings.sparse_embedding_model,
+            settings.sparse_embedding_batch_size,
+            settings.sparse_embedding_timeout_seconds,
+        ),
         hybrid_candidate_limit=settings.hybrid_candidate_limit,
     )
     chunker = HierarchicalChunker(

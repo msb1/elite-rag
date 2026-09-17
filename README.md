@@ -18,9 +18,14 @@ Open [Swagger UI](http://localhost:8080/docs) to use and inspect every endpoint.
 See [the API reference](docs/api.md) for request/response contracts and processing behavior.
 
 Qdrant stores two named vectors for each child chunk: the normalized EmbeddingGemma dense vector
-(`dense`) and a miniCOIL sparse vector (`sparse`). Queries retrieve candidates from both indexes
-using native Qdrant prefetch clauses, and Qdrant fuses the rankings with RRF before Jina
-reranking. The configured hybrid candidate window is `HYBRID_CANDIDATE_LIMIT` (default `100`).
+(`dense`) and a miniCOIL sparse vector (`sparse`). The API calls remote model services for both;
+it does not load embedding models locally. Queries retrieve candidates from both indexes using
+native Qdrant prefetch clauses, and Qdrant fuses the rankings with RRF before Jina reranking.
+The configured hybrid candidate window is `HYBRID_CANDIDATE_LIMIT` (default `100`).
+
+Deploy [the combined remote models service](services/remote-models.md) on the remote model
+computer before starting Elite RAG. It serves both miniCOIL and the unchanged Jina reranker route
+on port `8000`.
 
 ## API operations
 

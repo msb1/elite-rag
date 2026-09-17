@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from collections.abc import Callable, Iterable
@@ -9,6 +10,7 @@ from elite_rag.models import ChildChunk, ParentChunk, RawDocument, TopologicalBl
 
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[])|\n+(?=\S)")
 UUID_NAMESPACE = uuid.UUID("6db17d97-72e9-4bad-9817-4c3d279453ce")
+LOGGER = logging.getLogger(__name__)
 
 
 class HierarchicalChunker:
@@ -128,16 +130,44 @@ class HierarchicalChunker:
         chunks: list[str] = []
         current: list[str] = []
         for word in words:
-            if current and self.count_tokens(" ".join([*current, word])) > budget:
-                chunks.append(" ".join(current))
-                current = [word]
-            else:
-                current.append(word)
+            word_chunks = self._split_oversized_word(word, budget)
+            for word_chunk in word_chunks:
+                candidate = " ".join([*current, word_chunk])
+                if current and self.count_tokens(candidate) > budget:
+                    chunks.append(" ".join(current))
+                    current = [word_chunk]
+                else:
+                    current.append(word_chunk)
         if current:
             chunks.append(" ".join(current))
-        if any(self.count_tokens(chunk) > budget for chunk in chunks):
-            raise ValueError("A single token-like unit exceeds the configured chunk budget")
         return chunks
+
+    def _split_oversized_word(self, word: str, budget: int) -> list[str]:
+        """Split a non-whitespace token when word-level splitting is insufficient."""
+        if self.count_tokens(word) <= budget:
+            return [word]
+        LOGGER.warning(
+            "chunker_character_split token_chars=%s token_budget=%s", len(word), budget
+        )
+        pieces: list[str] = []
+        remaining = word
+        while remaining:
+            low = 1
+            high = len(remaining)
+            best = 0
+            while low <= high:
+                midpoint = (low + high) // 2
+                candidate = remaining[:midpoint]
+                if self.count_tokens(candidate) <= budget:
+                    best = midpoint
+                    low = midpoint + 1
+                else:
+                    high = midpoint - 1
+            if best == 0:
+                raise ValueError("A single character exceeds the configured chunk budget")
+            pieces.append(remaining[:best])
+            remaining = remaining[best:]
+        return pieces
 
     def _pack_atoms(self, atoms: list[str], budget: int) -> list[str]:
         chunks: list[str] = []

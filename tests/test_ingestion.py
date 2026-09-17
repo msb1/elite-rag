@@ -69,11 +69,11 @@ def test_document_specific_chunk_failure_is_recorded_and_next_document_ingests(
         missing_document_recorder=MissingDocumentRecorder(str(missing_docs_file)),
     )
     documents = [
-        RawDocument(
-            "bad-doc",
-            "jira",
-            "Broken export",
-                {"description": "x" * 1_500},
+            RawDocument(
+                "bad-doc",
+                "jira",
+                "x" * 5_000,
+                {"description": "Broken export"},
             {"object_key": "docs/jira/bad-doc.txt"},
         ),
         RawDocument("good-doc", "jira", "Good export", {"description": "Useful text."}),
@@ -89,3 +89,21 @@ def test_document_specific_chunk_failure_is_recorded_and_next_document_ingests(
     assert entries[0]["document_id"] == "bad-doc"
     assert entries[0]["object_key"] == "docs/jira/bad-doc.txt"
     assert entries[0]["error_type"] == "ValueError"
+
+
+def test_oversized_non_whitespace_token_is_split_without_skipping_document() -> None:
+    store = FakeStore()
+    engine = IngestionEngine(
+        ParserRegistry(),
+        HierarchicalChunker(len, child_max_tokens=150, parent_max_tokens=1_000),
+        FakeEmbedder(),  # type: ignore[arg-type]
+        store,  # type: ignore[arg-type]
+        batch_size=1,
+    )
+    document = RawDocument("long-token", "jira", "Long token", {"description": "x" * 1_500})
+
+    report = engine.ingest([document])
+
+    assert report.documents_ingested == 1
+    assert report.documents_skipped_failed == 0
+    assert report.children_upserted > 1

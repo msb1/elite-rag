@@ -48,6 +48,8 @@ Metrics requiring a reference answer reject requests without `ground_truth`.
 
 ## Production considerations
 
-The API process requires trusted-network access to Qdrant, RustFS, LM Studio-compatible
-model services, and the Jina reranker. Put authentication, authorization, rate limits,
-request-size limits, and TLS at the service boundary before external exposure.
+The API process requires trusted-network access to Qdrant, RustFS, the LM Studio-compatible
+EmbeddingGemma/Qwen/Llama services and the [combined remote models service](../services/remote-models.md)
+on port `8000`. It exposes Jina at `/v1/rerank` and miniCOIL at `/v1/embeddings/sparse`. Put
+authentication, authorization, rate limits, request-size limits, and TLS at the service boundary
+before external exposure.

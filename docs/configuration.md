@@ -14,7 +14,10 @@ project.
 | `QDRANT_COLLECTION` | `elite_rag` | collection containing child points |
 | `QDRANT_DENSE_VECTOR_NAME` | `dense` | named EmbeddingGemma vector field |
 | `QDRANT_SPARSE_VECTOR_NAME` | `sparse` | named miniCOIL sparse vector field |
-| `SPARSE_EMBEDDING_MODEL` | `Qdrant/minicoil-v1` | FastEmbed sparse neural retriever |
+| `SPARSE_EMBEDDING_MODEL` | `Qdrant/minicoil-v1` | miniCOIL model identity, deployed by the remote sparse service |
+| `SPARSE_EMBEDDING_URL` | `http://192.168.1.50:8000/v1/embeddings/sparse` | remote miniCOIL sparse-vector endpoint |
+| `SPARSE_EMBEDDING_BATCH_SIZE` | `8` | maximum texts sent to the remote sparse service in one request |
+| `SPARSE_EMBEDDING_TIMEOUT_SECONDS` | `30` | remote sparse-service request timeout |
 | `HYBRID_CANDIDATE_LIMIT` | `100` | dense and sparse prefetch window before native RRF fusion |
 
 The collection stores a named dense cosine vector and a named miniCOIL sparse vector with
@@ -22,10 +25,11 @@ Qdrant's `IDF` modifier. Changing vector names, the embedding dimension, or the 
 schema requires a compatible collection. Never recreate a production collection without a
 backup and a replayable source corpus.
 
-The `qdrant-client[fastembed]` extra is required. It lets the Python client download and run
-Qdrant's miniCOIL model through `models.Document` during point upserts and query construction.
-Dense and sparse vectors are fused inside Qdrant with reciprocal-rank fusion (RRF), so the
-application does not perform a second search or merge rankings in Python.
+Elite RAG uses the standard `qdrant-client`; it does not install or execute FastEmbed. Deploy the
+[combined remote models service](../services/remote-models.md) on the remote model computer. It
+returns numeric sparse vectors that Elite RAG sends to Qdrant and preserves the Jina reranker at
+the same host and port. Dense and sparse vectors are fused inside Qdrant with reciprocal-rank
+fusion (RRF), so the application does not perform a second search or merge rankings in Python.
 
 ## Embedding and chunking
 

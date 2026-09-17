@@ -38,8 +38,8 @@ This review produced the following changes:
   Linear candidates.
 - Removed explicit `source:` and `project:` syntax from corrective embedding text while
   preserving the corresponding hard Qdrant filter.
-- Added Qdrant FastEmbed miniCOIL sparse vectors, collection-level IDF configuration, and native
-  dense/sparse RRF fusion for primary and corrective retrieval passes.
+- Added a remote FastEmbed miniCOIL sparse-vector service, collection-level IDF configuration,
+  and native dense/sparse RRF fusion for primary and corrective retrieval passes.
 - Added this documentation set and linked it from the project README.
 - Added direct-to-RustFS archive upload and remote-object ingestion so the corpus need not
   be stored on the local computer.

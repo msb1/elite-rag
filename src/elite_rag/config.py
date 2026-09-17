@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     qdrant_dense_vector_name: str = "dense"
     qdrant_sparse_vector_name: str = "sparse"
     sparse_embedding_model: str = "Qdrant/minicoil-v1"
+    sparse_embedding_url: str = "http://192.168.1.50:8000/v1/embeddings/sparse"
+    sparse_embedding_batch_size: int = Field(default=8, ge=1, le=64)
+    sparse_embedding_timeout_seconds: float = Field(default=30.0, gt=0)
     hybrid_candidate_limit: int = Field(default=100, ge=1, le=1_000)
 
     # rag-bench's local OpenAI-compatible embedding service.
