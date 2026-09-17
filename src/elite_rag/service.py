@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
+from uuid import uuid4
 
 from elite_rag.api_models import (
     DirectDocumentIngestRequest,
@@ -17,10 +20,18 @@ from elite_rag.api_models import (
 from elite_rag.config import Settings
 from elite_rag.evaluation import LlamaEvaluator
 from elite_rag.ingestion import IngestionReport
+from elite_rag.ingestion_ledger import IngestionLedger
 from elite_rag.models import RawDocument
 from elite_rag.runtime import Runtime
-from elite_rag.rustfs import create_rustfs_client, iter_rustfs_documents, read_rustfs_document
+from elite_rag.rustfs import (
+    create_rustfs_client,
+    iter_rustfs_documents,
+    iter_rustfs_objects,
+    read_rustfs_document,
+)
 from elite_rag.vector_store import CollectionReport, SearchFilter
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RAGService:
@@ -44,6 +55,11 @@ class RAGService:
         progress: Callable[[IngestionReport], None] | None,
     ) -> IngestionReport:
         return await asyncio.to_thread(self._ingest_prefix_report, request, progress)
+
+    async def ingest_durable_prefix_run(
+        self, job_id: str, ledger: IngestionLedger
+    ) -> IngestionReport:
+        return await asyncio.to_thread(self._ingest_durable_prefix_run, job_id, ledger)
 
     async def ingest_object(self, request: RustFSObjectIngestRequest) -> IngestionReportResponse:
         return await asyncio.to_thread(self._ingest_object, request)
@@ -109,6 +125,83 @@ class RAGService:
             client, request.bucket, request.prefix, request.source, request.limit
         )
         return self._ingest_report(documents, request.replace_existing, progress)
+
+    def _ingest_durable_prefix_run(self, job_id: str, ledger: IngestionLedger) -> IngestionReport:
+        run = ledger.get_run(job_id)
+        if run is None:
+            raise ValueError(f"Ingestion job '{job_id}' was not found in the ledger")
+        client = create_rustfs_client(self.settings)
+        self.runtime.store.ensure_collection()
+        for object_info in iter_rustfs_objects(
+            client, run.bucket, run.prefix, run.source, run.limit
+        ):
+            ledger.add_work_item(
+                job_id,
+                run.bucket,
+                object_info.key,
+                run.source,
+                object_info.etag,
+                object_info.size_bytes,
+            )
+
+        worker_id = uuid4()
+        while True:
+            item = ledger.claim_next_item(job_id, worker_id)
+            if item is None:
+                lease_delay = ledger.seconds_until_next_claim(job_id)
+                if lease_delay is None:
+                    break
+                LOGGER.info(
+                    "ingestion_work_item_lease_waiting job_id=%s wait_seconds=%.1f",
+                    job_id,
+                    lease_delay,
+                )
+                time.sleep(min(lease_delay, 5.0))
+                continue
+            LOGGER.info(
+                (
+                    "ingestion_work_item_claimed job_id=%s item_id=%s bucket=%s key=%s "
+                    "attempt=%s"
+                ),
+                job_id,
+                item.item_id,
+                item.bucket,
+                item.key,
+                item.attempts,
+            )
+            try:
+                document = read_rustfs_document(client, item.bucket, item.key, item.source)
+                report = self.runtime.ingestion.ingest([document], run.replace_existing)
+            except Exception as exc:
+                ledger.retry_item(item, worker_id, exc)
+                LOGGER.exception(
+                    (
+                        "ingestion_work_item_retryable_failure job_id=%s item_id=%s "
+                        "key=%s error_type=%s"
+                    ),
+                    job_id,
+                    item.item_id,
+                    item.key,
+                    type(exc).__name__,
+                )
+                raise
+            permanent = report.documents_skipped_failed > 0
+            ledger.complete_item(item, worker_id, report, permanent)
+            LOGGER.info(
+                (
+                    "ingestion_work_item_completed job_id=%s item_id=%s key=%s status=%s "
+                    "children_upserted=%s"
+                ),
+                job_id,
+                item.item_id,
+                item.key,
+                "permanent_failure" if permanent else "completed",
+                report.children_upserted,
+            )
+        completed = ledger.get_run(job_id)
+        if completed is None:
+            raise RuntimeError(f"Ingestion job '{job_id}' disappeared from the ledger")
+        return completed.report
 
     def _ingest_object(self, request: RustFSObjectIngestRequest) -> IngestionReportResponse:
         client = create_rustfs_client(self.settings)

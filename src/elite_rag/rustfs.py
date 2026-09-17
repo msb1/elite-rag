@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -9,6 +10,13 @@ from elite_rag.config import Settings
 from elite_rag.models import RawDocument
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class RustFSObject:
+    key: str
+    etag: str | None
+    size_bytes: int | None
 
 
 def create_rustfs_client(settings: Settings) -> Any:
@@ -73,6 +81,38 @@ def iter_rustfs_documents(
                 document.source,
             )
             yield document
+            count += 1
+
+
+def iter_rustfs_objects(
+    client: Any,
+    bucket: str,
+    prefix: str = "documents",
+    source: str | None = None,
+    limit: int | None = None,
+) -> Iterator[RustFSObject]:
+    """List ingestible RustFS objects without downloading their contents."""
+    root = prefix.strip("/")
+    if source:
+        root = f"{root}/{source.strip('/')}"
+    LOGGER.info("rustfs_prefix_listing bucket=%s prefix=%s", bucket, root)
+    paginator = client.get_paginator("list_objects_v2")
+    count = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{root}/"):
+        for item in page.get("Contents", []):
+            key = str(item["Key"])
+            if key.endswith("/"):
+                continue
+            if limit is not None and count >= limit:
+                LOGGER.info(
+                    "rustfs_prefix_limit_reached bucket=%s prefix=%s limit=%s", bucket, root, limit
+                )
+                return
+            yield RustFSObject(
+                key=key,
+                etag=str(item["ETag"]).strip('"') if item.get("ETag") else None,
+                size_bytes=int(item["Size"]) if item.get("Size") is not None else None,
+            )
             count += 1
 
 

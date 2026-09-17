@@ -172,8 +172,9 @@ Response `202 Accepted`:
 }
 ```
 
-The API runs this bulk operation in an in-process background job so long jobs cannot exhaust an
-HTTP proxy timeout or look like a frozen request.
+The API runs this bulk operation in a background job so long jobs cannot exhaust an HTTP proxy
+timeout or look like a frozen request. PostgreSQL persistently records the job and every RustFS
+object work item, so FastAPI restarts do not lose completed-document progress.
 
 ## `GET /v1/ingest/jobs/{job_id}`
 
@@ -202,9 +203,10 @@ Completed response example:
 }
 ```
 
-A failed job has `status: "failed"` and an `error` with the exception type and reason. Job state
-is in-memory, so submit a new job after an API-process restart. The full stack trace is retained
-in `LOG_FILE`, whose default is `logs/elite-rag.log`.
+A failed job has `status: "failed"` and an `error` with the exception type and reason. Submit the
+same prefix request to resume its retryable object work items; completed objects are skipped. A
+server restart automatically resumes queued/running work after any active object lease expires.
+The full stack trace is retained in `LOG_FILE`, whose default is `logs/elite-rag.log`.
 
 The log records each `rustfs_object_read_started` / `rustfs_object_read_completed` event and each
 `qdrant_point_upserted` event. Monitor it while ingestion runs:

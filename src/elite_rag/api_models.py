@@ -44,6 +44,10 @@ class IngestionJobResponse(BaseModel):
     completed_at: datetime | None = None
     report: IngestionReportResponse | None = None
     error: str | None = None
+    work_items_total: int = 0
+    work_items_completed: int = 0
+    work_items_retryable: int = 0
+    work_items_permanent_failed: int = 0
 
 
 class RustFSPrefixIngestRequest(BaseModel):

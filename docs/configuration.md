@@ -14,6 +14,12 @@ project.
 | `QDRANT_COLLECTION` | `elite_rag` | collection containing child points |
 | `QDRANT_DENSE_VECTOR_NAME` | `dense` | named EmbeddingGemma vector field |
 | `QDRANT_SPARSE_VECTOR_NAME` | `sparse` | named miniCOIL sparse vector field |
+| `QDRANT_UPSERT_MAX_ATTEMPTS` | `5` | initial upsert plus bounded transient-failure retries |
+| `QDRANT_UPSERT_INITIAL_BACKOFF_SECONDS` | `0.5` | first retry delay; later delays double |
+| `QDRANT_UPSERT_MAX_BACKOFF_SECONDS` | `4.0` | cap for retry delay |
+| `INGESTION_DATABASE_URL` | `postgresql://user:password@192.168.1.50:5432/elite_rag` | durable ingestion-run and object-work-item ledger |
+| `INGESTION_LEASE_SECONDS` | `900` | object lease duration before a stopped worker's work can be reclaimed |
+| `INGESTION_PIPELINE_VERSION` | `v1` | checkpoint compatibility version; change after a material pipeline change |
 | `SPARSE_EMBEDDING_MODEL` | `Qdrant/minicoil-v1` | miniCOIL model identity, deployed by the remote sparse service |
 | `SPARSE_EMBEDDING_URL` | `http://192.168.1.50:8000/v1/embeddings/sparse` | remote miniCOIL sparse-vector endpoint |
 | `SPARSE_EMBEDDING_BATCH_SIZE` | `8` | maximum texts sent to the remote sparse service in one request |
@@ -30,6 +36,17 @@ Elite RAG uses the standard `qdrant-client`; it does not install or execute Fast
 returns numeric sparse vectors that Elite RAG sends to Qdrant and preserves the Jina reranker at
 the same host and port. Dense and sparse vectors are fused inside Qdrant with reciprocal-rank
 fusion (RRF), so the application does not perform a second search or merge rankings in Python.
+
+Each Qdrant upsert is retried only for transport errors and Qdrant HTTP 5xx responses. The
+default five attempts use 0.5, 1, 2, and 4 second delays after failed attempts. Every retry
+reuses the same deterministic point IDs, so it is safe if Qdrant applied a write before the
+connection failed. After the final attempt, the ingestion job fails as an infrastructure failure;
+the document is not recorded in `MISSING_DOCS_FILE`.
+
+Prefix ingestion uses PostgreSQL as its source of operational truth. It records one durable run
+and one work item per RustFS object. Completed objects are skipped when a failed prefix request is
+submitted again with the same source, collection, and pipeline version. An interrupted object is
+reclaimed when its lease expires; deterministic Qdrant IDs make reprocessing it safe.
 
 ## Embedding and chunking
 

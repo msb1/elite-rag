@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     qdrant_collection: str = "elite_rag"
     qdrant_dense_vector_name: str = "dense"
     qdrant_sparse_vector_name: str = "sparse"
+    qdrant_upsert_max_attempts: int = Field(default=5, ge=1, le=10)
+    qdrant_upsert_initial_backoff_seconds: float = Field(default=0.5, gt=0, le=60)
+    qdrant_upsert_max_backoff_seconds: float = Field(default=4.0, gt=0, le=300)
+    ingestion_database_url: str = ""
+    ingestion_lease_seconds: int = Field(default=900, ge=60, le=86_400)
+    ingestion_pipeline_version: str = "v1"
     sparse_embedding_model: str = "Qdrant/minicoil-v1"
     sparse_embedding_url: str = "http://192.168.1.50:8000/v1/embeddings/sparse"
     sparse_embedding_batch_size: int = Field(default=8, ge=1, le=64)

@@ -1,14 +1,29 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from elite_rag.models import ChildChunk
 from elite_rag.sparse_embedding import MiniCOILSparseEmbedder, SparseVector
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_retryable_upsert_error(exc: Exception) -> bool:
+    """Return whether re-sending deterministic Qdrant point IDs is safe and useful."""
+    if isinstance(exc, (httpx.TransportError, ResponseHandlingException)):
+        return True
+    return (
+        isinstance(exc, UnexpectedResponse)
+        and exc.status_code is not None
+        and 500 <= exc.status_code < 600
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +64,16 @@ class QdrantVectorStore:
         sparse_embedder: MiniCOILSparseEmbedder | None = None,
         hybrid_candidate_limit: int = 100,
         hybrid_enabled: bool = True,
+        upsert_max_attempts: int = 5,
+        upsert_initial_backoff_seconds: float = 0.5,
+        upsert_max_backoff_seconds: float = 4.0,
     ) -> None:
+        if upsert_max_attempts < 1:
+            raise ValueError("upsert_max_attempts must be at least 1")
+        if upsert_initial_backoff_seconds <= 0:
+            raise ValueError("upsert_initial_backoff_seconds must be greater than 0")
+        if upsert_max_backoff_seconds <= 0:
+            raise ValueError("upsert_max_backoff_seconds must be greater than 0")
         if client is None:
             from qdrant_client import QdrantClient
 
@@ -65,6 +89,9 @@ class QdrantVectorStore:
         self.sparse_embedder = sparse_embedder
         self.hybrid_candidate_limit = hybrid_candidate_limit
         self.hybrid_enabled = hybrid_enabled
+        self.upsert_max_attempts = upsert_max_attempts
+        self.upsert_initial_backoff_seconds = upsert_initial_backoff_seconds
+        self.upsert_max_backoff_seconds = upsert_max_backoff_seconds
 
     def ensure_collection(self, recreate: bool = False) -> CollectionReport:
         from qdrant_client.models import (
@@ -163,20 +190,7 @@ class QdrantVectorStore:
             for chunk, vector, sparse_vector in zip(chunks, vectors, sparse_vectors, strict=True)
         ]
         if points:
-            LOGGER.info(
-                "qdrant_upsert_started collection=%s points=%s",
-                self.collection_name,
-                len(points),
-            )
-            try:
-                self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
-            except Exception:
-                LOGGER.exception(
-                    "qdrant_upsert_failed collection=%s points=%s",
-                    self.collection_name,
-                    len(points),
-                )
-                raise
+            self._upsert_with_retries(points, chunks)
             for chunk in chunks:
                 LOGGER.info(
                     (
@@ -190,6 +204,77 @@ class QdrantVectorStore:
                     self.dense_vector_name if self.hybrid_enabled else "default",
                     self.sparse_vector_name if self.hybrid_enabled else "disabled",
                 )
+
+    def _upsert_with_retries(self, points: list[Any], chunks: Sequence[ChildChunk]) -> None:
+        document_ids = sorted({chunk.document_id for chunk in chunks})
+        for attempt in range(1, self.upsert_max_attempts + 1):
+            LOGGER.info(
+                (
+                    "qdrant_upsert_attempt collection=%s attempt=%s max_attempts=%s points=%s "
+                    "document_ids=%s"
+                ),
+                self.collection_name,
+                attempt,
+                self.upsert_max_attempts,
+                len(points),
+                document_ids,
+            )
+            try:
+                self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
+            except Exception as exc:
+                retryable = _is_retryable_upsert_error(exc)
+                exhausted = attempt == self.upsert_max_attempts
+                if not retryable or exhausted:
+                    LOGGER.exception(
+                        (
+                            "qdrant_upsert_failed collection=%s attempt=%s max_attempts=%s "
+                            "points=%s document_ids=%s retryable=%s exhausted=%s error_type=%s"
+                        ),
+                        self.collection_name,
+                        attempt,
+                        self.upsert_max_attempts,
+                        len(points),
+                        document_ids,
+                        retryable,
+                        exhausted,
+                        type(exc).__name__,
+                    )
+                    raise
+                delay = self._upsert_retry_delay(attempt)
+                LOGGER.warning(
+                    (
+                        "qdrant_upsert_retrying collection=%s attempt=%s next_attempt=%s "
+                        "max_attempts=%s points=%s document_ids=%s backoff_seconds=%.3f "
+                        "error_type=%s error=%s"
+                    ),
+                    self.collection_name,
+                    attempt,
+                    attempt + 1,
+                    self.upsert_max_attempts,
+                    len(points),
+                    document_ids,
+                    delay,
+                    type(exc).__name__,
+                    exc,
+                )
+                time.sleep(delay)
+                continue
+            LOGGER.info(
+                (
+                    "qdrant_upsert_completed collection=%s attempt=%s points=%s "
+                    "document_ids=%s"
+                ),
+                self.collection_name,
+                attempt,
+                len(points),
+                document_ids,
+            )
+            return
+        raise RuntimeError("Qdrant upsert retry loop completed without an outcome")
+
+    def _upsert_retry_delay(self, failed_attempt: int) -> float:
+        delay = self.upsert_initial_backoff_seconds * (2 ** (failed_attempt - 1))
+        return float(min(delay, self.upsert_max_backoff_seconds))
 
     def delete_document(self, document_id: str) -> None:
         from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue

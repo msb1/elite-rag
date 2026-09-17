@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -24,6 +25,7 @@ from elite_rag.api_models import (
 )
 from elite_rag.config import get_settings
 from elite_rag.evaluation import LlamaEvaluator
+from elite_rag.ingestion_ledger import IngestionLedger
 from elite_rag.jobs import IngestionJobManager
 from elite_rag.logging_config import configure_logging
 from elite_rag.runtime import build_runtime
@@ -37,7 +39,14 @@ LOGGER = logging.getLogger(__name__)
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_file, settings.log_level)
+    manager = get_job_manager()
+    await asyncio.to_thread(manager.ledger.ensure_schema)
+    resumed = manager.resume_unfinished(
+        lambda job_id: get_service().ingest_durable_prefix_run(job_id, manager.ledger)
+    )
     LOGGER.info("application_started log_file=%s", settings.log_file)
+    if resumed:
+        LOGGER.info("ingestion_jobs_resumed count=%s", resumed)
     yield
     LOGGER.info("application_stopped")
 
@@ -61,7 +70,12 @@ def get_service() -> RAGService:
 
 @lru_cache(maxsize=1)
 def get_job_manager() -> IngestionJobManager:
-    return IngestionJobManager()
+    settings = get_settings()
+    if not settings.ingestion_database_url:
+        raise RuntimeError("INGESTION_DATABASE_URL must be configured for durable ingestion")
+    return IngestionJobManager(
+        IngestionLedger(settings.ingestion_database_url, settings.ingestion_lease_seconds)
+    )
 
 
 @app.middleware("http")
@@ -119,10 +133,17 @@ async def initialize_collection(request: CollectionInitializeRequest) -> Collect
     summary="Recursively ingest all documents under a RustFS prefix",
 )
 async def ingest_rustfs_prefix(request: RustFSPrefixIngestRequest) -> IngestionJobResponse:
-    job = get_job_manager().submit(
-        request.bucket,
-        request.prefix,
-        lambda progress: get_service().ingest_prefix_with_progress(request, progress),
+    settings = get_settings()
+    manager = get_job_manager()
+    job = await manager.submit(
+        bucket=request.bucket,
+        prefix=request.prefix,
+        source=request.source,
+        limit=request.limit,
+        replace_existing=request.replace_existing,
+        collection_name=settings.qdrant_collection,
+        pipeline_version=settings.ingestion_pipeline_version,
+        operation=lambda job_id: get_service().ingest_durable_prefix_run(job_id, manager.ledger),
     )
     return IngestionJobResponse.model_validate(job.response())
 

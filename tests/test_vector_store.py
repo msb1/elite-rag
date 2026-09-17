@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
+import httpx
 import pytest
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from elite_rag.models import ChildChunk
 from elite_rag.sparse_embedding import SparseVector
@@ -80,6 +84,31 @@ class CapturingClient:
         return type("Result", (), {"points": []})()
 
 
+class FlakyUpsertClient:
+    def __init__(self, failures: list[Exception]) -> None:
+        self.failures = failures
+        self.upsert_calls = 0
+        self.point_id_batches: list[list[str]] = []
+
+    def upsert(self, **kwargs: object) -> None:
+        self.upsert_calls += 1
+        points = kwargs["points"]
+        self.point_id_batches.append([str(point.id) for point in points])  # type: ignore[union-attr]
+        if self.failures:
+            raise self.failures.pop(0)
+
+
+def _chunk() -> ChildChunk:
+    return ChildChunk(
+        child_id="00000000-0000-0000-0000-000000000001",
+        parent_id="parent-1",
+        document_id="doc-1",
+        text="child",
+        vector_text="embedded child",
+        metadata={"source": "jira", "_parent_context": "complete parent"},
+    )
+
+
 def test_hybrid_store_uses_named_dense_and_minicoil_sparse_vectors() -> None:
     client = CapturingClient()
     store = QdrantVectorStore(
@@ -110,3 +139,76 @@ def test_hybrid_store_uses_named_dense_and_minicoil_sparse_vectors() -> None:
     assert client.query_kwargs["query"].fusion == models.Fusion.RRF  # type: ignore[union-attr]
     assert client.query_kwargs["limit"] == 100
     assert prefetch[1].query.indices == [1, 2]  # type: ignore[index,union-attr]
+
+
+def test_upsert_retries_transient_reset_with_identical_point_ids(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="elite_rag.vector_store")
+    client = FlakyUpsertClient([httpx.ReadError("connection reset by peer")])
+    store = QdrantVectorStore(
+        "http://unused",
+        "test",
+        4,
+        client=client,
+        hybrid_enabled=False,
+        upsert_max_attempts=5,
+    )
+    delays: list[float] = []
+    monkeypatch.setattr("elite_rag.vector_store.time.sleep", delays.append)
+
+    store.upsert([_chunk()], [[1.0, 0.0, 0.0, 0.0]])
+
+    assert client.upsert_calls == 2
+    assert client.point_id_batches == [
+        ["00000000-0000-0000-0000-000000000001"],
+        ["00000000-0000-0000-0000-000000000001"],
+    ]
+    assert delays == [0.5]
+    assert "qdrant_upsert_retrying" in caplog.text
+    assert "qdrant_upsert_completed" in caplog.text
+
+
+def test_upsert_retries_qdrant_5xx_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FlakyUpsertClient(
+        [UnexpectedResponse(503, "Service Unavailable", b"unavailable", httpx.Headers())]
+    )
+    store = QdrantVectorStore(
+        "http://unused",
+        "test",
+        4,
+        client=client,
+        hybrid_enabled=False,
+        upsert_max_attempts=2,
+    )
+    monkeypatch.setattr("elite_rag.vector_store.time.sleep", lambda _: None)
+
+    store.upsert([_chunk()], [[1.0, 0.0, 0.0, 0.0]])
+
+    assert client.upsert_calls == 2
+
+
+def test_upsert_fails_after_transient_attempts_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = FlakyUpsertClient(
+        [httpx.ReadError("connection reset"), httpx.ReadError("connection reset")]
+    )
+    store = QdrantVectorStore(
+        "http://unused",
+        "test",
+        4,
+        client=client,
+        hybrid_enabled=False,
+        upsert_max_attempts=2,
+    )
+    delays: list[float] = []
+    monkeypatch.setattr("elite_rag.vector_store.time.sleep", delays.append)
+
+    with pytest.raises(httpx.ReadError, match="connection reset"):
+        store.upsert([_chunk()], [[1.0, 0.0, 0.0, 0.0]])
+
+    assert client.upsert_calls == 2
+    assert delays == [0.5]
+    assert "qdrant_upsert_failed" in caplog.text
+    assert "exhausted=True" in caplog.text

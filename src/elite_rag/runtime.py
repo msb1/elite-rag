@@ -37,6 +37,9 @@ def build_runtime(settings: Settings) -> Runtime:
         settings.qdrant_api_key,
         dense_vector_name=settings.qdrant_dense_vector_name,
         sparse_vector_name=settings.qdrant_sparse_vector_name,
+        upsert_max_attempts=settings.qdrant_upsert_max_attempts,
+        upsert_initial_backoff_seconds=settings.qdrant_upsert_initial_backoff_seconds,
+        upsert_max_backoff_seconds=settings.qdrant_upsert_max_backoff_seconds,
         sparse_embedder=MiniCOILSparseEmbedder(
             settings.sparse_embedding_url,
             settings.sparse_embedding_model,

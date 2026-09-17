@@ -32,10 +32,22 @@ parent contexts created, child vectors upserted, and replacements. The single-ob
 document paths remain synchronous. Use `replace_existing` for a changed document with the same
 stable ID.
 
+The prefix job and its RustFS object checkpoints live in PostgreSQL, not FastAPI memory. A server
+restart resumes queued/running jobs; a repeated matching prefix request resumes retryable failed
+objects and skips completed ones. A work item held by a stopped worker becomes reclaimable after
+`INGESTION_LEASE_SECONDS`. Document-specific parsing/chunking failures become durable permanent
+work-item failures; infrastructure failures remain retryable and fail the run after their current
+attempt.
+
 Every RustFS object read and every successfully upserted Qdrant point is recorded in the
 append-only `LOG_FILE` (default `logs/elite-rag.log`). `tail -f logs/elite-rag.log` is suitable
 for progress monitoring. Failed requests and background jobs include complete exception traces in
 that log; job status also exposes the exception type and message.
+
+Qdrant upserts retry transport errors and HTTP 5xx responses with a bounded exponential backoff.
+The log records every attempt, retry delay, point count, document IDs, and final outcome. Because
+the same deterministic point IDs are reused, a retry is safe even if Qdrant accepted a write but
+the client lost its response.
 
 ## Retrieval and scoring
 
