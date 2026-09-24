@@ -10,7 +10,7 @@ from elite_rag.api_models import IngestionReportResponse, MetricsBreakdown, RagR
 
 @dataclass
 class FakeService:
-    async def ingest_document(self, request: object) -> IngestionReportResponse:
+    async def ingest_document(self, request: object, ledger: object) -> IngestionReportResponse:
         return IngestionReportResponse(
             documents_seen=1,
             documents_ingested=1,

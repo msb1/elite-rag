@@ -23,7 +23,10 @@ project.
 | `SPARSE_EMBEDDING_MODEL` | `Qdrant/minicoil-v1` | miniCOIL model identity, deployed by the remote sparse service |
 | `SPARSE_EMBEDDING_URL` | `http://192.168.1.50:8000/v1/embeddings/sparse` | remote miniCOIL sparse-vector endpoint |
 | `SPARSE_EMBEDDING_BATCH_SIZE` | `8` | maximum texts sent to the remote sparse service in one request |
-| `SPARSE_EMBEDDING_TIMEOUT_SECONDS` | `30` | remote sparse-service request timeout |
+| `SPARSE_EMBEDDING_TIMEOUT_SECONDS` | `120` | remote sparse-service request timeout |
+| `SPARSE_EMBEDDING_MAX_ATTEMPTS` | `5` | initial request plus bounded transient-failure retries |
+| `SPARSE_EMBEDDING_INITIAL_BACKOFF_SECONDS` | `0.5` | first retry delay; later delays double |
+| `SPARSE_EMBEDDING_MAX_BACKOFF_SECONDS` | `4.0` | maximum sparse-service retry delay |
 | `HYBRID_CANDIDATE_LIMIT` | `100` | dense and sparse prefetch window before native RRF fusion |
 
 The collection stores a named dense cosine vector and a named miniCOIL sparse vector with
@@ -43,10 +46,12 @@ reuses the same deterministic point IDs, so it is safe if Qdrant applied a write
 connection failed. After the final attempt, the ingestion job fails as an infrastructure failure;
 the document is not recorded in `MISSING_DOCS_FILE`.
 
-Prefix ingestion uses PostgreSQL as its source of operational truth. It records one durable run
-and one work item per RustFS object. Completed objects are skipped when a failed prefix request is
-submitted again with the same source, collection, and pipeline version. An interrupted object is
-reclaimed when its lease expires; deterministic Qdrant IDs make reprocessing it safe.
+Prefix ingestion uses PostgreSQL as its source of operational truth. It records durable runs and
+work items, plus one current-state record per RustFS object successfully written to Qdrant. During
+inventory, Elite RAG compares each object's bucket, key, ETag, collection, and pipeline version in
+batches; unchanged objects are not downloaded, chunked, embedded, or upserted again. An interrupted
+object is reclaimed when its lease expires. Recreating or newly creating the configured Qdrant
+collection through the collection API clears this ledger after Qdrant succeeds.
 
 ## Embedding and chunking
 

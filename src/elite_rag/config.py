@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     sparse_embedding_model: str = "Qdrant/minicoil-v1"
     sparse_embedding_url: str = "http://192.168.1.50:8000/v1/embeddings/sparse"
     sparse_embedding_batch_size: int = Field(default=8, ge=1, le=64)
-    sparse_embedding_timeout_seconds: float = Field(default=30.0, gt=0)
+    sparse_embedding_timeout_seconds: float = Field(default=120.0, gt=0)
+    sparse_embedding_max_attempts: int = Field(default=5, ge=1, le=10)
+    sparse_embedding_initial_backoff_seconds: float = Field(default=0.5, gt=0, le=60)
+    sparse_embedding_max_backoff_seconds: float = Field(default=4.0, gt=0, le=300)
     hybrid_candidate_limit: int = Field(default=100, ge=1, le=1_000)
 
     # rag-bench's local OpenAI-compatible embedding service.

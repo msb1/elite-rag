@@ -57,9 +57,9 @@ curl -X POST http://localhost:8080/v1/ingest/rustfs/prefix \
 ```
 
 Prefix ingestion returns `202` with a `job_id`; it does not hold the HTTP connection open. Poll
-`GET /v1/ingest/jobs/{job_id}` for progress and errors. PostgreSQL persists the job and each
-RustFS-object checkpoint, so submitting the same failed prefix resumes unfinished work instead of
-restarting completed objects. The append-only log is `logs/elite-rag.log` by default and is
+`GET /v1/ingest/jobs/{job_id}` for progress and errors. PostgreSQL persists each successfully
+indexed RustFS object with its ETag, collection, and pipeline version, so a later prefix run
+processes only new or changed objects. The append-only log is `logs/elite-rag.log` by default and is
 controlled by `LOG_FILE` and `LOG_LEVEL`.
 
 The configuration is a single gitignored `.env`; [.env.example](.env.example) documents

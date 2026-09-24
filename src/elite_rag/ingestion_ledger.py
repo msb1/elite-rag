@@ -62,6 +62,14 @@ class IngestionWorkItem:
     attempts: int
 
 
+@dataclass(frozen=True, slots=True)
+class InventoryBatchResult:
+    """Outcome of comparing an inventory batch with the current Qdrant ledger."""
+
+    scheduled: int
+    already_indexed: int
+
+
 class IngestionLedger:
     """Transactional ledger that makes object-level ingestion restartable."""
 
@@ -126,8 +134,105 @@ class IngestionLedger:
                 CREATE INDEX IF NOT EXISTS ingestion_work_items_lease_idx
                     ON ingestion_work_items (lease_expires_at)
                     WHERE status = 'processing';
+
+                CREATE TABLE IF NOT EXISTS ingested_objects (
+                    bucket TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    etag TEXT NULL,
+                    source TEXT NULL,
+                    size_bytes BIGINT NULL,
+                    collection_name TEXT NOT NULL,
+                    pipeline_version TEXT NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (bucket, object_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS ingested_objects_match_idx
+                    ON ingested_objects (bucket, object_key, collection_name, pipeline_version);
+
+                INSERT INTO ingested_objects (
+                    bucket, object_key, etag, source, size_bytes, collection_name, pipeline_version,
+                    completed_at
+                )
+                SELECT DISTINCT ON (item.bucket, item.object_key)
+                    item.bucket,
+                    item.object_key,
+                    item.etag,
+                    item.source,
+                    item.size_bytes,
+                    run.collection_name,
+                    run.pipeline_version,
+                    item.completed_at
+                FROM ingestion_work_items AS item
+                JOIN ingestion_runs AS run ON run.job_id = item.job_id
+                WHERE item.status = 'completed'
+                ORDER BY item.bucket, item.object_key, item.completed_at DESC NULLS LAST
+                ON CONFLICT (bucket, object_key) DO NOTHING;
                 """
             )
+
+    def clear(self) -> None:
+        """Remove all ingestion state after a successful Qdrant collection recreation."""
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("TRUNCATE TABLE ingestion_runs CASCADE")
+            cursor.execute("TRUNCATE TABLE ingested_objects")
+
+    def is_current(
+        self, bucket: str, key: str, etag: str, collection_name: str, pipeline_version: str
+    ) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM ingested_objects
+                    WHERE bucket = %s AND object_key = %s AND etag = %s
+                      AND collection_name = %s AND pipeline_version = %s
+                )
+                """,
+                (bucket, key, etag, collection_name, pipeline_version),
+            )
+            row = cursor.fetchone()
+            return bool(row[0]) if row is not None else False
+
+    def has_current_object(
+        self, bucket: str, key: str, collection_name: str, pipeline_version: str
+    ) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM ingested_objects
+                    WHERE bucket = %s AND object_key = %s
+                      AND collection_name = %s AND pipeline_version = %s
+                )
+                """,
+                (bucket, key, collection_name, pipeline_version),
+            )
+            row = cursor.fetchone()
+            return bool(row[0]) if row is not None else False
+
+    def record_current(
+        self,
+        bucket: str,
+        key: str,
+        etag: str,
+        source: str,
+        size_bytes: int,
+        collection_name: str,
+        pipeline_version: str,
+    ) -> None:
+        self._execute(
+            """
+            INSERT INTO ingested_objects (
+                bucket, object_key, etag, source, size_bytes, collection_name, pipeline_version
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (bucket, object_key) DO UPDATE
+            SET etag = EXCLUDED.etag, source = EXCLUDED.source, size_bytes = EXCLUDED.size_bytes,
+                collection_name = EXCLUDED.collection_name,
+                pipeline_version = EXCLUDED.pipeline_version, completed_at = NOW()
+            """,
+            (bucket, key, etag, source, size_bytes, collection_name, pipeline_version),
+        )
 
     def create_or_resume_run(
         self,
@@ -143,7 +248,7 @@ class IngestionLedger:
         with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
-                SELECT job_id FROM ingestion_runs
+                SELECT job_id, status FROM ingestion_runs
                 WHERE bucket = %s
                   AND prefix = %s
                   AND source IS NOT DISTINCT FROM %s
@@ -189,23 +294,24 @@ class IngestionLedger:
                 )
             else:
                 job_id = existing["job_id"]
-                cursor.execute(
-                    """
-                    UPDATE ingestion_runs
-                    SET status = 'queued', error = NULL, completed_at = NULL
-                    WHERE job_id = %s
-                    """,
-                    (job_id,),
-                )
-                cursor.execute(
-                    """
-                    UPDATE ingestion_work_items
-                    SET status = 'pending', error_type = NULL, error = NULL,
-                        lease_owner = NULL, lease_expires_at = NULL
-                    WHERE job_id = %s AND status = 'retryable_failure'
-                    """,
-                    (job_id,),
-                )
+                if existing["status"] == "failed":
+                    cursor.execute(
+                        """
+                        UPDATE ingestion_runs
+                        SET status = 'queued', error = NULL, completed_at = NULL
+                        WHERE job_id = %s
+                        """,
+                        (job_id,),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE ingestion_work_items
+                        SET status = 'pending', error_type = NULL, error = NULL,
+                            lease_owner = NULL, lease_expires_at = NULL
+                        WHERE job_id = %s AND status = 'retryable_failure'
+                        """,
+                        (job_id,),
+                    )
         run = self.get_run(str(job_id))
         if run is None:
             raise RuntimeError("Newly created ingestion run could not be read")
@@ -327,6 +433,67 @@ class IngestionLedger:
             (UUID(job_id), bucket, key, source, etag, size_bytes),
         )
 
+    def add_work_items(
+        self,
+        job_id: str,
+        bucket: str,
+        source: str | None,
+        objects: list[tuple[str, str | None, int | None]],
+        collection_name: str,
+        pipeline_version: str,
+    ) -> InventoryBatchResult:
+        """Schedule only objects absent from the current successful-ingestion ledger."""
+        if not objects:
+            return InventoryBatchResult(scheduled=0, already_indexed=0)
+        values_sql = ", ".join("(%s, %s, %s)" for _ in objects)
+        object_parameters: list[object] = [value for row in objects for value in row]
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                WITH incoming (object_key, etag, size_bytes) AS (
+                    VALUES {values_sql}
+                ),
+                already_indexed AS (
+                    SELECT incoming.object_key
+                    FROM incoming
+                    JOIN ingested_objects AS indexed
+                      ON indexed.bucket = %s
+                     AND indexed.object_key = incoming.object_key
+                     AND indexed.etag IS NOT DISTINCT FROM incoming.etag
+                     AND indexed.collection_name = %s
+                     AND indexed.pipeline_version = %s
+                ),
+                scheduled AS (
+                    INSERT INTO ingestion_work_items (
+                        job_id, bucket, object_key, source, etag, size_bytes, status
+                    )
+                    SELECT %s, %s, incoming.object_key, %s, incoming.etag, incoming.size_bytes,
+                           'pending'
+                    FROM incoming
+                    LEFT JOIN already_indexed USING (object_key)
+                    WHERE already_indexed.object_key IS NULL
+                    ON CONFLICT (job_id, bucket, object_key) DO NOTHING
+                    RETURNING object_key
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM scheduled) AS scheduled,
+                    (SELECT COUNT(*) FROM already_indexed) AS already_indexed
+                """,
+                [
+                    *object_parameters,
+                    bucket,
+                    collection_name,
+                    pipeline_version,
+                    UUID(job_id),
+                    bucket,
+                    source,
+                ],
+            )
+            row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("Ingestion inventory batch did not return a result")
+        return InventoryBatchResult(scheduled=int(row[0]), already_indexed=int(row[1]))
+
     def claim_next_item(self, job_id: str, worker_id: UUID) -> IngestionWorkItem | None:
         with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
@@ -388,34 +555,66 @@ class IngestionLedger:
         return max(0.0, float(value[0]))
 
     def complete_item(
-        self, item: IngestionWorkItem, worker_id: UUID, report: IngestionReport, permanent: bool
+        self,
+        item: IngestionWorkItem,
+        worker_id: UUID,
+        report: IngestionReport,
+        permanent: bool,
+        collection_name: str,
+        pipeline_version: str,
     ) -> None:
         status = "permanent_failure" if permanent else "completed"
         values = asdict(report)
-        self._execute(
-            """
-            UPDATE ingestion_work_items
-            SET status = %s, lease_owner = NULL, lease_expires_at = NULL, completed_at = NOW(),
-                documents_seen = %s, documents_ingested = %s,
-                documents_skipped_empty = %s, documents_skipped_failed = %s,
-                parents_created = %s, children_upserted = %s, batches_upserted = %s,
-                documents_replaced = %s
-            WHERE item_id = %s AND lease_owner = %s
-            """,
-            (
-                status,
-                values["documents_seen"],
-                values["documents_ingested"],
-                values["documents_skipped_empty"],
-                values["documents_skipped_failed"],
-                values["parents_created"],
-                values["children_upserted"],
-                values["batches_upserted"],
-                values["documents_replaced"],
-                item.item_id,
-                worker_id,
-            ),
-        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE ingestion_work_items
+                SET status = %s, lease_owner = NULL, lease_expires_at = NULL, completed_at = NOW(),
+                    documents_seen = %s, documents_ingested = %s,
+                    documents_skipped_empty = %s, documents_skipped_failed = %s,
+                    parents_created = %s, children_upserted = %s, batches_upserted = %s,
+                    documents_replaced = %s
+                WHERE item_id = %s AND lease_owner = %s
+                """,
+                (
+                    status,
+                    values["documents_seen"],
+                    values["documents_ingested"],
+                    values["documents_skipped_empty"],
+                    values["documents_skipped_failed"],
+                    values["parents_created"],
+                    values["children_upserted"],
+                    values["batches_upserted"],
+                    values["documents_replaced"],
+                    item.item_id,
+                    worker_id,
+                ),
+            )
+            if permanent:
+                return
+            cursor.execute(
+                """
+                INSERT INTO ingested_objects (
+                    bucket, object_key, etag, source, size_bytes, collection_name, pipeline_version
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bucket, object_key) DO UPDATE
+                SET etag = EXCLUDED.etag,
+                    source = EXCLUDED.source,
+                    size_bytes = EXCLUDED.size_bytes,
+                    collection_name = EXCLUDED.collection_name,
+                    pipeline_version = EXCLUDED.pipeline_version,
+                    completed_at = NOW()
+                """,
+                (
+                    item.bucket,
+                    item.key,
+                    item.etag,
+                    item.source,
+                    item.size_bytes,
+                    collection_name,
+                    pipeline_version,
+                ),
+            )
 
     def retry_item(self, item: IngestionWorkItem, worker_id: UUID, error: Exception) -> None:
         self._execute(

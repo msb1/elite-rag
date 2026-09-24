@@ -45,6 +45,9 @@ def build_runtime(settings: Settings) -> Runtime:
             settings.sparse_embedding_model,
             settings.sparse_embedding_batch_size,
             settings.sparse_embedding_timeout_seconds,
+            settings.sparse_embedding_max_attempts,
+            settings.sparse_embedding_initial_backoff_seconds,
+            settings.sparse_embedding_max_backoff_seconds,
         ),
         hybrid_candidate_limit=settings.hybrid_candidate_limit,
     )

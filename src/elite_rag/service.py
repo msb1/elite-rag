@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable, Iterable
@@ -25,8 +27,10 @@ from elite_rag.models import RawDocument
 from elite_rag.runtime import Runtime
 from elite_rag.rustfs import (
     create_rustfs_client,
+    head_rustfs_object,
     iter_rustfs_documents,
     iter_rustfs_objects,
+    list_rustfs_child_prefixes,
     read_rustfs_document,
 )
 from elite_rag.vector_store import CollectionReport, SearchFilter
@@ -61,11 +65,13 @@ class RAGService:
     ) -> IngestionReport:
         return await asyncio.to_thread(self._ingest_durable_prefix_run, job_id, ledger)
 
-    async def ingest_object(self, request: RustFSObjectIngestRequest) -> IngestionReportResponse:
-        return await asyncio.to_thread(self._ingest_object, request)
+    async def ingest_object(
+        self, request: RustFSObjectIngestRequest, ledger: IngestionLedger
+    ) -> IngestionReportResponse:
+        return await asyncio.to_thread(self._ingest_object, request, ledger)
 
     async def ingest_document(
-        self, request: DirectDocumentIngestRequest
+        self, request: DirectDocumentIngestRequest, ledger: IngestionLedger
     ) -> IngestionReportResponse:
         document = RawDocument(
             document_id=request.document_id,
@@ -74,7 +80,7 @@ class RAGService:
             fields={"content": request.content},
             metadata=request.metadata,
         )
-        return await asyncio.to_thread(self._ingest, [document], request.replace_existing)
+        return await asyncio.to_thread(self._ingest_document_with_ledger, document, request, ledger)
 
     async def rag(
         self, query: str, top_k: int, filters: RetrievalFilters | None
@@ -132,17 +138,85 @@ class RAGService:
             raise ValueError(f"Ingestion job '{job_id}' was not found in the ledger")
         client = create_rustfs_client(self.settings)
         self.runtime.store.ensure_collection()
-        for object_info in iter_rustfs_objects(
-            client, run.bucket, run.prefix, run.source, run.limit
-        ):
-            ledger.add_work_item(
-                job_id,
-                run.bucket,
-                object_info.key,
-                run.source,
-                object_info.etag,
-                object_info.size_bytes,
+        inventoried = 0
+        sources = (run.source,) if run.source else list_rustfs_child_prefixes(
+            client, run.bucket, run.prefix
+        )
+        if not sources:
+            raise RuntimeError(
+                f"No child source prefixes were found below {run.bucket}/{run.prefix.strip('/')}"
             )
+        remaining_limit = run.limit
+        for source in sources:
+            if remaining_limit is not None and remaining_limit <= 0:
+                break
+            source_count = 0
+            source_scheduled = 0
+            source_already_indexed = 0
+            inventory_batch: list[tuple[str, str | None, int | None]] = []
+            for object_info in iter_rustfs_objects(
+                client,
+                run.bucket,
+                run.prefix,
+                source,
+                remaining_limit,
+            ):
+                inventory_batch.append((object_info.key, object_info.etag, object_info.size_bytes))
+                source_count += 1
+                if len(inventory_batch) < 500:
+                    continue
+                result = ledger.add_work_items(
+                    job_id,
+                    run.bucket,
+                    source,
+                    inventory_batch,
+                    self.settings.qdrant_collection,
+                    self.settings.ingestion_pipeline_version,
+                )
+                inventoried += len(inventory_batch)
+                source_scheduled += result.scheduled
+                source_already_indexed += result.already_indexed
+                LOGGER.info(
+                    "ingestion_inventory_progress job_id=%s source=%s source_objects=%s "
+                    "objects=%s scheduled=%s already_indexed=%s",
+                    job_id,
+                    source,
+                    source_count,
+                    inventoried,
+                    source_scheduled,
+                    source_already_indexed,
+                )
+                inventory_batch.clear()
+            if inventory_batch:
+                result = ledger.add_work_items(
+                    job_id,
+                    run.bucket,
+                    source,
+                    inventory_batch,
+                    self.settings.qdrant_collection,
+                    self.settings.ingestion_pipeline_version,
+                )
+                inventoried += len(inventory_batch)
+                source_scheduled += result.scheduled
+                source_already_indexed += result.already_indexed
+            if remaining_limit is not None:
+                remaining_limit -= source_count
+            LOGGER.info(
+                "ingestion_source_inventory_completed job_id=%s source=%s objects=%s total=%s "
+                "scheduled=%s already_indexed=%s",
+                job_id,
+                source,
+                source_count,
+                inventoried,
+                source_scheduled,
+                source_already_indexed,
+            )
+        LOGGER.info(
+            "ingestion_inventory_completed job_id=%s sources=%s objects=%s",
+            job_id,
+            len(sources),
+            inventoried,
+        )
 
         worker_id = uuid4()
         while True:
@@ -186,7 +260,14 @@ class RAGService:
                 )
                 raise
             permanent = report.documents_skipped_failed > 0
-            ledger.complete_item(item, worker_id, report, permanent)
+            ledger.complete_item(
+                item,
+                worker_id,
+                report,
+                permanent,
+                self.settings.qdrant_collection,
+                self.settings.ingestion_pipeline_version,
+            )
             LOGGER.info(
                 (
                     "ingestion_work_item_completed job_id=%s item_id=%s key=%s status=%s "
@@ -203,10 +284,71 @@ class RAGService:
             raise RuntimeError(f"Ingestion job '{job_id}' disappeared from the ledger")
         return completed.report
 
-    def _ingest_object(self, request: RustFSObjectIngestRequest) -> IngestionReportResponse:
+    def _ingest_object(
+        self, request: RustFSObjectIngestRequest, ledger: IngestionLedger
+    ) -> IngestionReportResponse:
         client = create_rustfs_client(self.settings)
+        object_info = head_rustfs_object(client, request.bucket, request.key)
+        etag = object_info.etag or ""
+        if ledger.is_current(
+            request.bucket,
+            request.key,
+            etag,
+            self.settings.qdrant_collection,
+            self.settings.ingestion_pipeline_version,
+        ):
+            return IngestionReportResponse(**asdict(IngestionReport()))
         document = read_rustfs_document(client, request.bucket, request.key, request.source)
-        return self._ingest([document], request.replace_existing)
+        replace_existing = request.replace_existing or ledger.has_current_object(
+            request.bucket,
+            request.key,
+            self.settings.qdrant_collection,
+            self.settings.ingestion_pipeline_version,
+        )
+        report = self._ingest_report([document], replace_existing, None)
+        if report.documents_ingested:
+            ledger.record_current(
+                request.bucket,
+                request.key,
+                etag,
+                document.source,
+                object_info.size_bytes or 0,
+                self.settings.qdrant_collection,
+                self.settings.ingestion_pipeline_version,
+            )
+        return IngestionReportResponse(**asdict(report))
+
+    def _ingest_document_with_ledger(
+        self, document: RawDocument, request: DirectDocumentIngestRequest, ledger: IngestionLedger
+    ) -> IngestionReportResponse:
+        bucket = "__direct_text__"
+        fingerprint = _direct_document_fingerprint(document)
+        if ledger.is_current(
+            bucket,
+            document.document_id,
+            fingerprint,
+            self.settings.qdrant_collection,
+            self.settings.ingestion_pipeline_version,
+        ):
+            return IngestionReportResponse(**asdict(IngestionReport()))
+        replace_existing = request.replace_existing or ledger.has_current_object(
+            bucket,
+            document.document_id,
+            self.settings.qdrant_collection,
+            self.settings.ingestion_pipeline_version,
+        )
+        report = self._ingest_report([document], replace_existing, None)
+        if report.documents_ingested:
+            ledger.record_current(
+                bucket,
+                document.document_id,
+                fingerprint,
+                document.source,
+                len(request.content.encode("utf-8")),
+                self.settings.qdrant_collection,
+                self.settings.ingestion_pipeline_version,
+            )
+        return IngestionReportResponse(**asdict(report))
 
     def _ingest(
         self, documents: Iterable[RawDocument], replace_existing: bool
@@ -228,3 +370,20 @@ def _to_search_filter(filters: RetrievalFilters | None) -> SearchFilter | None:
     if filters is None or not (filters.sources or filters.projects):
         return None
     return SearchFilter(sources=tuple(filters.sources), projects=tuple(filters.projects))
+
+
+def _direct_document_fingerprint(document: RawDocument) -> str:
+    payload = json.dumps(
+        {
+            "document_id": document.document_id,
+            "source": document.source,
+            "title": document.title,
+            "fields": document.fields,
+            "metadata": document.metadata,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

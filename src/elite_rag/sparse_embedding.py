@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -23,12 +24,18 @@ class MiniCOILSparseEmbedder:
         endpoint_url: str,
         model_name: str,
         batch_size: int = 8,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
+        max_attempts: int = 5,
+        initial_backoff_seconds: float = 0.5,
+        max_backoff_seconds: float = 4.0,
     ) -> None:
         self.endpoint_url = endpoint_url
         self.model_name = model_name
         self.batch_size = batch_size
         self.timeout_seconds = timeout_seconds
+        self.max_attempts = max_attempts
+        self.initial_backoff_seconds = initial_backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
 
     def embed_documents(self, texts: Sequence[str]) -> list[SparseVector]:
         return self._embed(texts, "document")
@@ -42,14 +49,7 @@ class MiniCOILSparseEmbedder:
         vectors: list[SparseVector] = []
         for start in range(0, len(texts), self.batch_size):
             batch = list(texts[start : start + self.batch_size])
-            LOGGER.info("minicoil_remote_request_started mode=%s texts=%s", mode, len(batch))
-            response = requests.post(
-                self.endpoint_url,
-                headers={"Content-Type": "application/json"},
-                json={"model": self.model_name, "mode": mode, "texts": batch},
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
+            response = self._request_with_retries(batch, mode)
             payload = response.json()
             raw_vectors = payload.get("vectors", [])
             if len(raw_vectors) != len(batch):
@@ -65,3 +65,56 @@ class MiniCOILSparseEmbedder:
             )
             LOGGER.info("minicoil_remote_request_completed mode=%s texts=%s", mode, len(batch))
         return vectors
+
+    def _request_with_retries(self, batch: list[str], mode: str) -> requests.Response:
+        for attempt in range(1, self.max_attempts + 1):
+            LOGGER.info(
+                "minicoil_remote_request_started mode=%s texts=%s attempt=%s max_attempts=%s",
+                mode,
+                len(batch),
+                attempt,
+                self.max_attempts,
+            )
+            retryable_error: Exception
+            try:
+                response = requests.post(
+                    self.endpoint_url,
+                    headers={"Content-Type": "application/json"},
+                    json={"model": self.model_name, "mode": mode, "texts": batch},
+                    timeout=self.timeout_seconds,
+                )
+                if 500 <= response.status_code < 600:
+                    response.raise_for_status()
+                response.raise_for_status()
+                return response
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                retryable_error = exc
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is None or not 500 <= exc.response.status_code < 600:
+                    raise
+                retryable_error = exc
+            if attempt == self.max_attempts:
+                LOGGER.error(
+                    "minicoil_remote_request_exhausted mode=%s texts=%s attempts=%s "
+                    "error_type=%s",
+                    mode,
+                    len(batch),
+                    attempt,
+                    type(retryable_error).__name__,
+                )
+                raise retryable_error
+            delay = min(
+                self.initial_backoff_seconds * (2 ** (attempt - 1)),
+                self.max_backoff_seconds,
+            )
+            LOGGER.warning(
+                "minicoil_remote_request_retrying mode=%s texts=%s attempt=%s "
+                "next_delay_seconds=%.2f error_type=%s",
+                mode,
+                len(batch),
+                attempt,
+                delay,
+                type(retryable_error).__name__,
+            )
+            time.sleep(delay)
+        raise AssertionError("miniCOIL retry loop exited unexpectedly")

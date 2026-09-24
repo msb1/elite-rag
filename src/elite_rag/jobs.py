@@ -56,12 +56,6 @@ class IngestionJobManager:
     def get(self, job_id: str) -> DurableIngestionRun | None:
         return self.ledger.get_run(job_id)
 
-    def resume_unfinished(self, operation: RunOperation) -> int:
-        runs = self.ledger.resumable_runs()
-        for run in runs:
-            self._start(run.job_id, operation)
-        return len(runs)
-
     def _start(self, job_id: str, operation: RunOperation) -> None:
         with self._lock:
             if job_id in self._active_job_ids:

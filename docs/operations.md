@@ -13,7 +13,8 @@ Interactive OpenAPI documentation is available at `http://localhost:8080/docs`.
 
 Use `POST /v1/collections/initialize` with an empty JSON object to create or verify the
 configured collection. Set `recreate` only for disposable collections; it deletes all
-existing points before creating the collection again.
+existing points before creating the collection again. After a successful create or recreation,
+Elite RAG clears its PostgreSQL ingestion ledger so the ledger remains aligned with Qdrant.
 
 ## Ingestion
 
@@ -32,12 +33,14 @@ parent contexts created, child vectors upserted, and replacements. The single-ob
 document paths remain synchronous. Use `replace_existing` for a changed document with the same
 stable ID.
 
-The prefix job and its RustFS object checkpoints live in PostgreSQL, not FastAPI memory. A server
-restart resumes queued/running jobs; a repeated matching prefix request resumes retryable failed
-objects and skips completed ones. A work item held by a stopped worker becomes reclaimable after
-`INGESTION_LEASE_SECONDS`. Document-specific parsing/chunking failures become durable permanent
-work-item failures; infrastructure failures remain retryable and fail the run after their current
-attempt.
+The prefix job and its RustFS object checkpoints live in PostgreSQL, not FastAPI memory. Server
+startup never starts or resumes ingestion; only an explicit prefix-ingestion API request can do so.
+Each new inventory compares RustFS bucket, key, ETag,
+collection, and pipeline version against the current successful-ingestion ledger; unchanged objects
+are skipped before download and only new/changed objects receive work items. A work item held by a
+stopped worker becomes reclaimable after `INGESTION_LEASE_SECONDS`. Document-specific
+parsing/chunking failures become durable permanent work-item failures; infrastructure failures remain
+retryable and fail the run after their current attempt.
 
 Every RustFS object read and every successfully upserted Qdrant point is recorded in the
 append-only `LOG_FILE` (default `logs/elite-rag.log`). `tail -f logs/elite-rag.log` is suitable

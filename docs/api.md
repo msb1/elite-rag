@@ -79,6 +79,8 @@ Processing steps:
 4. Creates a named dense cosine vector using `EMBEDDING_DIMENSION` and a named miniCOIL sparse
    vector with Qdrant's `IDF` modifier when absent.
 5. Creates or verifies the native payload indexes.
+6. Clears the PostgreSQL ingestion ledger after Qdrant successfully creates or recreates the
+   collection, keeping the ledger aligned with the collection contents.
 
 Response `200`:
 
@@ -147,14 +149,17 @@ you intend to override the source detected from the RustFS key for every object.
 Processing steps:
 
 1. Connects to RustFS with `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY`.
-2. Paginates `list_objects_v2` for every object below the prefix.
-3. Reads each JSON or text object from RustFS.
-4. Converts JSON through the EnterpriseRAG-Bench field-declaration loader; text becomes a
+2. Discovers immediate source prefixes, then lists each source prefix independently.
+3. Compares every inventory batch against the current PostgreSQL ledger using bucket, key, ETag,
+   collection, and pipeline version; unchanged objects are skipped before download.
+4. Reads each new or changed JSON or text object from RustFS.
+5. Converts JSON through the EnterpriseRAG-Bench field-declaration loader; text becomes a
    `RawDocument` using the first line as title.
-5. Ensures the Qdrant collection and indexes exist.
-6. Uses the source-aware parser, creates zero-overlap child chunks and bounded parent contexts,
+6. Ensures the Qdrant collection and indexes exist.
+7. Uses the source-aware parser, creates zero-overlap child chunks and bounded parent contexts,
    requests EmbeddingGemma dense vectors and the remote miniCOIL service's sparse vectors, then
    upserts named dense/sparse child vectors into Qdrant.
+8. Records the object in the current-state ledger only after the Qdrant upsert succeeds.
 
 Response `202 Accepted`:
 
