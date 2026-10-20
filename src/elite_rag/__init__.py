@@ -1,3 +1,1 @@
-"""Elite RAG: deterministic enterprise retrieval and generation."""
-
-__version__ = "0.1.0"
+"""Document indexing service for Elite RAG."""

@@ -19,7 +19,6 @@
   },
   "projects": {
     "devops": "devops",
-    "hydra": "hydra",
-    "sre": "sre"
+    "hydra": "hydra"
   }
 }

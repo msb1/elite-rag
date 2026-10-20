@@ -1,157 +1,109 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass
+from threading import Lock
 
-from elite_rag.chunking import HierarchicalChunker
-from elite_rag.embedding import EmbeddingGemma
-from elite_rag.missing_documents import MissingDocumentRecorder
-from elite_rag.models import ChildChunk, RawDocument
-from elite_rag.parsing.base import ParserRegistry
-from elite_rag.vector_store import QdrantVectorStore
+from elite_rag.chunking import HierarchicalPassageChunker
+from elite_rag.config import Settings
+from elite_rag.documents import SourceDocument
+from elite_rag.embedding import HybridEmbedder
+from elite_rag.multi import MultiPassageStore, multi_settings
+from elite_rag.store import CollectionReport
+from elite_rag.tokenization import TokenCounter
 
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class IngestionReport:
     documents_seen: int = 0
     documents_ingested: int = 0
+    documents_skipped_unchanged: int = 0
     documents_skipped_empty: int = 0
     documents_skipped_failed: int = 0
     parents_created: int = 0
+    expected_passages: int = 0
+    verified_passages: int = 0
     children_upserted: int = 0
     batches_upserted: int = 0
     documents_replaced: int = 0
 
+    def add(self, other: IngestionReport) -> None:
+        for key, value in asdict(other).items():
+            setattr(self, key, getattr(self, key) + value)
 
-class IngestionEngine:
-    def __init__(
-        self,
-        registry: ParserRegistry,
-        chunker: HierarchicalChunker,
-        embedder: EmbeddingGemma,
-        store: QdrantVectorStore,
-        batch_size: int = 64,
-        missing_document_recorder: MissingDocumentRecorder | None = None,
-    ) -> None:
-        self.registry = registry
-        self.chunker = chunker
-        self.embedder = embedder
-        self.store = store
-        self.batch_size = batch_size
-        self.missing_document_recorder = missing_document_recorder
 
-    def ingest(
-        self,
-        documents: Iterable[RawDocument],
-        replace_existing: bool = False,
-        progress: Callable[[IngestionReport], None] | None = None,
-    ) -> IngestionReport:
-        documents_seen = 0
-        documents_ingested = 0
-        documents_skipped_empty = 0
-        documents_skipped_failed = 0
-        parent_count = 0
-        child_count = 0
-        batch_count = 0
-        replaced_count = 0
-        pending: list[ChildChunk] = []
-
-        def report_snapshot() -> IngestionReport:
-            return IngestionReport(
-                documents_seen=documents_seen,
-                documents_ingested=documents_ingested,
-                documents_skipped_empty=documents_skipped_empty,
-                documents_skipped_failed=documents_skipped_failed,
-                parents_created=parent_count,
-                children_upserted=child_count,
-                batches_upserted=batch_count,
-                documents_replaced=replaced_count,
-            )
-
-        for document in documents:
-            documents_seen += 1
-            LOGGER.info(
-                "ingestion_document_started document_id=%s source=%s title=%r",
-                document.document_id,
-                document.source,
-                document.title,
-            )
-            try:
-                blocks = self.registry.parse(document)
-                if blocks:
-                    parents, children = self.chunker.chunk(document, blocks)
-            except Exception as exc:
-                documents_skipped_failed += 1
-                self._record_failed_document(document, exc)
-                if progress:
-                    progress(report_snapshot())
-                continue
-            if not blocks:
-                documents_skipped_empty += 1
-                LOGGER.info("ingestion_document_skipped_empty document_id=%s", document.document_id)
-                if progress:
-                    progress(report_snapshot())
-                continue
-            if replace_existing:
-                self.store.delete_document(document.document_id)
-                replaced_count += 1
-            parent_text = {parent.parent_id: parent.text for parent in parents}
-            for child in children:
-                metadata = {**child.metadata, "_parent_context": parent_text[child.parent_id]}
-                pending.append(replace(child, metadata=metadata))
-                if len(pending) >= self.batch_size:
-                    child_count += self._flush(pending)
-                    batch_count += 1
-                    pending.clear()
-            parent_count += len(parents)
-            documents_ingested += 1
-            LOGGER.info(
-                "ingestion_document_completed document_id=%s parents=%s children=%s",
-                document.document_id,
-                len(parents),
-                len(children),
-            )
-            if progress:
-                progress(report_snapshot())
-        if pending:
-            child_count += self._flush(pending)
-            batch_count += 1
-        report = report_snapshot()
-        if progress:
-            progress(report)
-        return report
-
-    def _flush(self, chunks: list[ChildChunk]) -> int:
-        LOGGER.info("ingestion_batch_embedding_started chunks=%s", len(chunks))
-        vectors = self.embedder.embed_documents([chunk.vector_text for chunk in chunks])
-        self.store.upsert(chunks, vectors)
-        LOGGER.info("ingestion_batch_upsert_completed chunks=%s", len(chunks))
-        return len(chunks)
-
-    def _record_failed_document(self, document: RawDocument, exc: Exception) -> None:
-        LOGGER.exception(
-            "ingestion_document_skipped_failed document_id=%s source=%s error_type=%s",
-            document.document_id,
-            document.source,
-            type(exc).__name__,
+class IngestionService:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = multi_settings(settings)
+        self.store = MultiPassageStore(self.settings)
+        self.embedder = HybridEmbedder(
+            self.settings.embedding_model,
+            self.settings.embedding_dimension,
+            self.settings.embedding_base_url,
+            self.settings.embedding_api_key,
         )
-        if self.missing_document_recorder is None:
-            return
+        self._chunker: HierarchicalPassageChunker | None = None
+        self._collection_report: CollectionReport | None = None
+        self._collection_lock = Lock()
+
+    def initialize_collection(self) -> CollectionReport:
+        """Create or validate the collection once for this ingestion service."""
+        with self._collection_lock:
+            if self._collection_report is None:
+                self._collection_report = self.store.ensure_collection()
+            return self._collection_report
+
+    @property
+    def chunker(self) -> HierarchicalPassageChunker:
+        if self._chunker is None:
+            repository = self.settings.tokenizer_repository
+            assert repository is not None
+            self._chunker = HierarchicalPassageChunker(
+                self.settings,
+                TokenCounter(repository, self.settings.tokenizer_json_path).count,
+            )
+        return self._chunker
+
+    def ingest(self, document: SourceDocument, replace_existing: bool = False) -> IngestionReport:
+        report = IngestionReport(documents_seen=1)
+        self.initialize_collection()
+        passages = self.chunker.chunk(document)
+        if not passages:
+            self.store.delete_document(document.document_id)
+            report.documents_skipped_empty = 1
+            return report
+        report.expected_passages = len(passages)
+        revision = passages[0].metadata["revision"]
+        if self.store.revision_count(document.document_id, revision, ready_only=True) == len(
+            passages
+        ):
+            self.store.delete_other_revisions(document.document_id, revision)
+            report.verified_passages = len(passages)
+            report.documents_skipped_unchanged = 1
+            return report
         try:
-            entry = self.missing_document_recorder.record(document, exc)
+            for start in range(0, len(passages), self.settings.embedding_batch_size):
+                batch = passages[start : start + self.settings.embedding_batch_size]
+                vectors = self.embedder.embed_documents(
+                    [passage.embedding_text for passage in batch]
+                )
+                self.store.upsert(batch, vectors)
+                report.children_upserted += len(batch)
+                report.batches_upserted += 1
+            self.store.commit_revision(document.document_id, revision, len(passages))
+            report.verified_passages = len(passages)
+            self.store.delete_other_revisions(document.document_id, revision)
         except Exception:
-            LOGGER.exception(
-                "missing_document_record_failed document_id=%s file_recorder=%s",
-                document.document_id,
-                type(self.missing_document_recorder).__name__,
-            )
-            return
-        LOGGER.warning(
-            "missing_document_recorded document_id=%s object_key=%s error_type=%s",
-            entry.document_id,
-            entry.object_key,
-            entry.error_type,
+            LOGGER.exception("ingestion_failed document_id=%s", document.document_id)
+            raise
+        report.documents_ingested = 1
+        report.documents_replaced = int(replace_existing)
+        LOGGER.info(
+            "ingestion_completed document_id=%s revision=%s passages=%s",
+            document.document_id,
+            revision,
+            len(passages),
         )
+        return report

@@ -151,6 +151,11 @@ activemq-data/
 # Environments
 .env
 .envrc
+
+# Generated RAG answers, evaluation metrics, and run reports
+results/*.jsonl
+results/*.json
+results/*.svg
 .venv
 env/
 venv/
@@ -222,3 +227,8 @@ __marimo__/
 answer_evaluation/*.jsonl
 data/
 models/
+
+archive/
+logs/
+remotes/
+results/

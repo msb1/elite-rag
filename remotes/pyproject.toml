@@ -1,16 +1,16 @@
 [project]
 name = "elite-rag-remote-models"
 version = "0.1.0"
-description = "Combined remote Jina Reranker v3.5 and miniCOIL FastAPI service"
-readme = "remote-models.md"
+description = "Remote BGE reranker and BGE-M3 dense and sparse embedding APIs"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "fastapi>=0.115,<1",
-  "fastembed>=0.7,<1",
+  "huggingface-hub>=0.26,<2",
   "psutil>=6,<8",
   "python-dotenv>=1.0,<2",
+  "sentence-transformers>=3.4,<6",
   "torch>=2.9,<2.11",
-  "transformers>=4.49,<5",
+  "transformers>=4.51,<5",
   "uvicorn[standard]>=0.34,<1",
 ]
 
