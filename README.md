@@ -6,9 +6,12 @@ answer generation, and the project's JSONL question benchmark.
 
 ## Configuration and services
 
-`.env` is the application's configuration source. The collection is `elite_rag_multi`, the
-RustFS bucket is `enterprise-rag`, and the document prefix is `docs`. Configure the Qdrant,
-RustFS, embedding, reranking, answer-model, and judge-model endpoints there.
+`.env` is the application's configuration source. The default collection is `elite_rag_v2`,
+the RustFS bucket is `enterprise-rag`, and the document prefix is `docs`. Configure the
+Qdrant, RustFS, embedding, reranking, answer-model, and judge-model endpoints there. The
+implementation, retrieval concepts, and operating procedures are documented in
+[`docs/architecture.md`](docs/architecture.md), [`docs/concepts.md`](docs/concepts.md), and
+[`docs/operation.md`](docs/operation.md).
 
 The BGE model service in `remotes/remote-models.py` exposes `/v1/embeddings` for dense and
 learned sparse BGE-M3 vectors and `/v1/rerank` for the BGE reranker. The local ingestion and
@@ -106,7 +109,8 @@ Metrics are faithfulness, answer relevancy, context recall, context precision, a
 correctness. Results and analysis artifacts are written under `results/`.
 
 The HTTP API exposes `/v1/retrieve`, `/v1/rag`, `/v1/evaluate`, `/v1/benchmark`, `/v1/eval`,
-and `/v1/analyze`. Request and response schemas are available at `/docs`.
+`/v1/analyze`, and ingestion and collection endpoints. Request and response schemas are
+available at `/docs`.
 
 ## Archive
 
