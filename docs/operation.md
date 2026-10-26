@@ -2,7 +2,7 @@
 
 Run commands from the repository root so `.env` and relative input/output paths resolve
 consistently. The [README](../README.md) gives the end-to-end sequence;
-[ragas.md](../ragas.md) is the exact scoring reference.
+[ragas.md](ragas.md) is the exact scoring reference.
 
 ## Configuration
 
@@ -153,7 +153,7 @@ uv run python scripts/eval.py --input results/questions_run.jsonl --output resul
 ```
 
 Evaluation requires only the saved answers, judge, and hybrid embedding service. It reuses
-RAGAS 0.4.3 prompts/schemas and calculates scores locally. See [ragas.md](../ragas.md) for
+RAGAS 0.4.3 prompts/schemas and calculates scores locally. See [ragas.md](ragas.md) for
 formulas, validation, and edge cases. `elite-rag eval` accepts the same flags.
 
 The implementation ID is `ragas-0.4.3-prompts-json-parent-context-v3`. The runner rejects an output
@@ -195,7 +195,7 @@ ranks; short and empty results remain in the denominator as misses.
 Use `at_k["5"].target_doc_hit_rate` (console label `target_doc_hit_rate@5`) for the success
 criterion that at least one expected parent ID was retrieved in the top five parent ranks;
 document recall measures the fraction of all expected parent IDs found. See
-[ragas.md](../ragas.md#deterministic-document-retrieval-metrics).
+[ragas.md](ragas.md#deterministic-document-retrieval-metrics).
 
 Low judge context recall is a review signal rather than a confirmed parent-document retrieval miss.
 Compare final source coverage with candidate/reranked document lists from the separate

@@ -25,7 +25,8 @@ RustFS → parse fields/sections → child chunks → BGE-M3 dense + learned spa
 | `benchmark/extra_questions.jsonl` | Additional questions; selected only if configured or explicitly supplied to retrieval testing |
 | `tests/` | Evaluator tests using simulated model and embedding responses |
 | `docs/` | [Architecture](docs/architecture.md), [concepts](docs/concepts.md), and [operation](docs/operation.md) |
-| [ragas.md](ragas.md) | Exact implemented metric formulas, prompt flow, validation, retries, and document metrics |
+| [ragas.md](docs/ragas.md) | Exact implemented metric formulas, prompt flow, validation, retries, and document metrics |
+| [ragbench.md](docs/ragbench.md) | RAGBench benchmark workflow and evaluation notes |
 | `results/`, `logs/` | Configurable generated artifacts and API logs |
 | `configs/filter_aliases.json` | Retained configuration file; the active retriever does not load it |
 | `archive/` | Historical code, configuration, and results; not the active application |
@@ -134,7 +135,7 @@ The evaluator reuses RAGAS 0.4.3 prompt classes and Pydantic output schemas, sen
 chat completions to the configured judge, and calculates five scores locally: faithfulness,
 answer relevancy, context recall, context precision with reference, and answer correctness.
 Relevancy and correctness also use the configured BGE dense embeddings. This is a local
-wrapper, not execution of the official metric classes. [ragas.md](ragas.md) specifies its
+wrapper, not execution of the official metric classes. [ragas.md](docs/ragas.md) specifies its
 exact formulas and edge cases.
 
 The current implementation ID is `ragas-0.4.3-prompts-json-parent-context-v3`. Successful rows are

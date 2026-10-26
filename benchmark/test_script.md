@@ -16,7 +16,7 @@ output is overwritten on rerun. Generation skips saved IDs; evaluation skips suc
 and retries errors. Use new output filenames for a new experiment or scoring implementation.
 Check evaluation statuses even if the command exits 0. Analysis output locations come from
 `.env`; `--input` does not change where reports are written. The exact metric contract is
-[ragas.md](../ragas.md).
+[ragas.md](../docs/ragas.md).
 
 uv run python scripts/prepare_enterpriserag_answers.py
 uv run python scripts/run_enterpriserag_eval.py --parallelism 4 --no-correction --results-file results/enterpriserag_results.json

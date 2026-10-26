@@ -1,10 +1,10 @@
 # Implemented RAG metrics
 
 This is the scoring contract of the current local implementation in
-[`evaluation.py`](src/elite_rag/evaluation.py), [`eval.py`](src/elite_rag/eval.py),
-[`retrieval_metrics.py`](src/elite_rag/retrieval_metrics.py), and
-[`analyze.py`](src/elite_rag/analyze.py). The dependency is pinned to `ragas==0.4.3` in
-[`pyproject.toml`](pyproject.toml). The batch implementation ID is:
+[`evaluation.py`](../src/elite_rag/evaluation.py), [`eval.py`](../src/elite_rag/eval.py),
+[`retrieval_metrics.py`](../src/elite_rag/retrieval_metrics.py), and
+[`analyze.py`](../src/elite_rag/analyze.py). The dependency is pinned to `ragas==0.4.3` in
+[`pyproject.toml`](../pyproject.toml). The batch implementation ID is:
 
 ```text
 ragas-0.4.3-prompts-json-parent-context-v3

@@ -7,7 +7,8 @@ runs through separately configured embedding, reranking, answer, and evaluation 
 
 This document describes the implementation in `src/elite_rag` and the batch utilities in
 `scripts`. The commands are documented in [operation.md](operation.md), the terms in
-[concepts.md](concepts.md), and exact metric behavior in [../ragas.md](../ragas.md).
+[concepts.md](concepts.md), local metric behavior in [ragas.md](ragas.md), and the
+EnterpriseRAG-Bench workflow in [ragbench.md](ragbench.md).
 The high-level flow is:
 
 ```mermaid
@@ -44,6 +45,7 @@ flowchart LR
     EM <--> EMB
     IC --> Q
     BI --> RD
+    CLI --> BI
     API --> IC
     API --> RAG
     CLI --> RAG
@@ -53,6 +55,7 @@ flowchart LR
     RAG --> LLM
     API --> EVAL
     CLI --> EVAL
+    EVAL --> RAG
     EVAL <--> JUDGE
     EVAL --> EMB
     EVAL --> Files[JSONL and analysis artifacts]
@@ -78,6 +81,7 @@ independent sequential batch over configured source folders.
 | Prefix job control | `jobs.py` | Queue, process, persist, resume, and report API RustFS prefix jobs |
 | Retrieval and answer | `rag.py` | Three-channel search, RRF, BGE reranking, context assembly, and grounded answer generation |
 | Quality workflow | `benchmark.py`, `evaluation.py`, `eval.py`, `retrieval_metrics.py`, `analyze.py` | Run benchmark questions, ask judge model for scores, summarize results, and export failure rows |
+| EnterpriseRAG-Bench adapter | `scripts/prepare_enterpriserag_answers.py`, `scripts/run_enterpriserag_eval.py` | Convert saved answers and source IDs, then invoke an external benchmark checkout using the configured judge |
 | Command line | `cli.py`, `scripts/` | Start the API and run RAG, benchmark, evaluation, analysis, ingestion, and retrieval utilities |
 
 The package's `PassageStore` contains reusable Qdrant collection and revision operations.
@@ -123,8 +127,11 @@ Each child passage contains a deterministic point ID, parent document ID, ordina
 section identity, parsed-section offsets where recoverable, token count, and metadata. Metadata
 includes a content revision, pipeline signature, source and normalized entity attributes,
 source metadata, and section evidence. The child is one Qdrant point; parent documents are
-not separately vector-indexed. Payloads retain the parent document text when source fields are
-plain strings, plus the full parsed section text for fallback context expansion.
+not separately vector-indexed. Payloads retain parent text assembled from non-empty string
+fields, plus the full parsed section text for fallback context expansion. Structured list and
+dictionary fields are parsed into passages but are omitted from `document_full_text`; if any
+string-field parent text is available, generation uses that text rather than adding retrieved
+structured sections to it.
 
 ### Vector generation and collection schema
 
@@ -142,7 +149,7 @@ BM25 inference and applies IDF.
 
 The names above are defaults. `multi_settings()` requires all three names to be non-empty and
 distinct, requires the BGE-M3 configuration, and requires the BM25 model to be
-`Qdrant/bm25`. On collection creation, the store creates payload indexes for document ID,
+`Qdrant/bm25`. On collection creation and reuse, the store ensures payload indexes for document ID,
 source, project ID, revision, field name, section ID, and readiness. On reuse, it validates
 the dense size/distance, sparse vector presence, and modifiers; incompatible schemas fail with a
 collection schema error.
@@ -186,8 +193,9 @@ sequenceDiagram
     end
 ```
 
-If an exception occurs before commit, the new points remain not ready and are excluded from
-retrieval. Publication is not an atomic revision swap: new and old ready revisions may
+Until readiness is published, new points are excluded from retrieval. If the ready count
+does not match after publication, `commit_revision` attempts to reset the revision to not
+ready and raises an error. Publication is not an atomic revision swap: new and old ready revisions may
 coexist briefly before cleanup. A subsequent ingestion attempt can upsert the same
 deterministic IDs and retry.
 An unchanged revision is skipped only when the expected count of ready points is present. An
@@ -204,69 +212,123 @@ revision checks allow safe reruns even if the script stops partway through.
 
 The API prefix endpoint creates an ingestion job and returns its ID. `IngestionJobs` runs its
 work in a background thread, reads RustFS objects, and uses object ETags for a fast unchanged
-check before parsing. With `INGESTION_DATABASE_URL`, job state and object tracking are stored
+check before parsing. Tracking is scoped by bucket, object key, collection, and pipeline
+signature. With `INGESTION_DATABASE_URL`, job state and object tracking are stored
 in PostgreSQL; startup resumes jobs recorded as queued or running, and advisory locks prevent
 multiple workers from processing the same resumed job concurrently. Without a database URL,
 job and object state lives in process memory and does not survive restart. The API also
 supports one RustFS object and direct document ingestion synchronously through the shared
 ingestion service.
 
+Prefix jobs skip invalid document content and count it as failed. Other read or ingestion
+errors fail the job; startup resumes only jobs still recorded as queued or running. A failed
+job requires a new submission, which can reuse object tracking and ready revisions.
+
 ## Retrieval and answer architecture
 
-`TriVectorRetriever` validates the configured collection, embeds a question once for dense
-and learned sparse query vectors, then sends three Qdrant prefetch queries: dense, learned
-sparse, and BM25 with the original question text. All three are filtered to
-`ingestion_ready=true`. Qdrant combines their ranked candidates with reciprocal rank fusion
-(RRF) and returns up to `RETRIEVAL_NUMBER` fused results.
+### Retrieval, reranking, and parent context assembly
 
-`RagService` passes the original question and each child candidate's title, section path, and
-text to the BGE reranking endpoint. A valid reranker response must rank every candidate exactly
-once. The service maps ranked child hits to parent documents by parent document ID, deduplicates
-parents in first-hit order, and applies `RERANK_TOP_N` to unique parents. It expands each parent
-to its stored full text; if that text is unavailable, it uses retrieved section context and
-adds a warning. If reranking fails, it applies the same parent expansion and cutoff to the
-Qdrant fused order. No query expansion or query rewriting is performed.
+`TriVectorRetriever` validates the configured collection at construction, embeds a question
+once for dense and learned sparse query vectors, then sends three Qdrant prefetch queries:
+dense, learned sparse, and BM25 with the original question text. All three are filtered to
+`ingestion_ready=true`. Each prefetch and the fused result use `RETRIEVAL_NUMBER` as their
+limit. Qdrant combines the ranked candidates with reciprocal rank fusion (RRF). The client
+discards hits with missing or blank passage text.
 
-The answer request includes the system instruction, deduplicated parent-document texts, and
-original question. Thus `RERANK_TOP_N=5` means at most five unique parent contexts reach
-generation, even when several high-ranking child hits belong to the same parent. The response returns the answer, parent
-contexts, parent document IDs, matched child passage IDs/sections, rerank scores, and warnings.
-When no valid parent context remains, the fixed no-answer response is returned without calling
-the answer model.
+`RagService.retrieve` passes the original question and each child candidate's title, section
+path, and text to the BGE reranking endpoint. A valid response must rank every candidate
+exactly once. If reranking fails, the service retains the Qdrant fused order and adds a warning.
+No query expansion or query rewriting is performed.
+
+`expand_to_parent_documents` then groups child hits by parent document ID in first-hit order
+and selects up to `RERANK_TOP_N` unique parents. Hits without a parent ID are skipped with a
+warning. Expansion uses text already present in the retrieved payloads; it makes no additional
+Qdrant or RustFS read. Stored `document_full_text` takes precedence. When it is unavailable,
+the service joins retrieved sections in section order, falling back to child text when section
+text is absent, and adds a warning. Parents with no usable text are skipped. The resulting
+context includes title, source, matched sections, and parent text.
+
+The returned provenance includes matched passage IDs and sections collected during this scan.
+The scan stops at the first new parent beyond the cutoff, so it may not collect later child
+matches for already selected parents. `RERANK_TOP_N=5` limits generation to at most five unique
+parent contexts. `MULTI_DOCUMENT_SCORE` is validated but does not control this ordering.
 
 ```mermaid
 sequenceDiagram
-    actor User
-    participant API as FastAPI or CLI
-    participant RAG as RagService
+    participant Caller as API, CLI, or benchmark
+    participant RAG as RagService.retrieve
     participant Embed as BGE-M3 embedding endpoint
     participant Q as Qdrant
     participant Rank as BGE reranker
-    participant Answer as Answer model
 
-    User->>API: question
-    API->>RAG: retrieve / answer(question)
-    RAG->>Embed: embed query
+    Caller->>RAG: original question
+    RAG->>Embed: embed query once
     Embed-->>RAG: dense + learned sparse query vectors
-    RAG->>Q: dense prefetch + learned sparse prefetch + BM25 prefetch
-    Note over RAG,Q: Every prefetch filters ingestion_ready=true
-    Q-->>RAG: RRF fused passages and payloads
-    RAG->>Rank: original question + title/section/body candidates
-    alt reranker responds with complete ranking
-        Rank-->>RAG: ordered candidate indexes + relevance scores
-    else reranking fails
-        Rank-->>RAG: error or invalid response
-        Note over RAG: Keep RRF order and add warning
+    RAG->>Q: dense + learned sparse + BM25 prefetch, then RRF
+    Note over RAG,Q: Each prefetch filters ingestion_ready=true
+    Q-->>RAG: fused child passages and payloads
+    alt candidates remain after text validation
+        RAG->>Rank: question + title/section/body for every candidate
+        alt complete ranking returned
+            Rank-->>RAG: ordered indexes + relevance scores
+        else reranking fails
+            Rank-->>RAG: error or invalid response
+            Note over RAG: Keep RRF order and add warning
+        end
+        RAG->>RAG: select unique parents up to RERANK_TOP_N
+        RAG->>RAG: expand payload text and collect source metadata
     end
-    alt at least one passage
-        RAG->>Answer: system prompt + deduplicated parent texts + question
-        Answer-->>RAG: grounded answer
-    else no passages
-        RAG->>RAG: return fixed no-answer text
-    end
-    RAG-->>API: answer, contexts, source metadata, warnings
-    API-->>User: JSON result or CLI output
+    RAG-->>Caller: parent contexts + warnings
 ```
+
+`POST /v1/retrieve` returns these parent contexts under the JSON key `passages` and stops
+here. `RagService.answer`, used by `POST /v1/rag`, the RAG CLI, and benchmark generation,
+continues through the following flow.
+
+### Answer generation after retrieval
+
+`RagService.answer` receives the parent contexts and warnings from `retrieve`. With no
+contexts it immediately returns `I cannot find the answer in the provided documents.` with
+empty `contexts` and `sources` lists. Otherwise it wraps each context in a numbered
+`Source ID: [Doc N]` block and joins the blocks into the user message under
+`[Retrieved Context]`, followed by the original question under `[User Query]`.
+
+```mermaid
+flowchart TD
+    Retrieved["Parent contexts, source metadata, and warnings from retrieve"] --> HasContext{"Any parent context?"}
+    HasContext -->|No| Abstain["Fixed no-answer text; empty contexts and sources"]
+    HasContext -->|Yes| Blocks["Wrap ordered contexts in Source ID: Doc N blocks"]
+    Blocks --> UserMessage["User message: Retrieved Context + User Query"]
+    Question["Original question"] --> UserMessage
+    UserMessage --> Chat["Answer model: chat.completions.create"]
+    System["System instruction: use context facts; abstain if insufficient; omit source labels"] --> Chat
+    Config["RAG_MODEL, RAG_TEMPERATURE, RAG_MAX_TOKENS"] --> Chat
+    Chat --> Content["Read first choice content and strip whitespace"]
+    Chat -->|Request failure| Error["Raise error; RAG API maps it to HTTP 502"]
+    Content --> Nonempty{"Non-empty answer?"}
+    Nonempty -->|No| Error
+    Nonempty -->|Yes| Result["Return question, answer, contexts, sources, warnings"]
+    Abstain --> Result
+    Retrieved -.->|Aligned context text and source metadata| Result
+```
+
+The request uses `RAG_SYSTEM_PROMPT` as the system message and the assembled context/question
+as a single user message. It calls the OpenAI-compatible endpoint configured by
+`OPENAI_LOCAL_ENDPOINT`, with `LLM_API_KEY`, `RAG_MODEL`, `RAG_TEMPERATURE`, and
+`RAG_MAX_TOKENS`. The application sends the full assembled contexts without a total input-token
+budget or truncation step; `RAG_MAX_TOKENS` limits generated output. Requests carry no prior
+conversation history.
+
+The system prompt asks the model to use only explicit context facts, omit source labels,
+and return the fixed no-answer sentence when evidence is insufficient. This behavior is
+prompt-driven: the application checks for an empty answer but performs no factual verification
+or citation validation before returning it. Evaluation is a separate workflow.
+
+For a generated answer, `contexts` contains the same ordered context strings used in the
+prompt. The aligned `sources` list includes parent document IDs, the representative child
+passage ID, collected matched child IDs/sections, title, source, and optional rerank score.
+Reranking and expansion warnings are returned alongside the result. Model request failures
+and empty answers propagate as errors rather than being converted to abstentions.
 
 ## API and process boundaries
 
@@ -275,8 +337,9 @@ collection, clears object tracking if the collection had to be newly created, an
 unfinished persisted jobs. Expensive synchronous retrieval, generation, ingestion, benchmark,
 and evaluation work is dispatched with `asyncio.to_thread` by the endpoints.
 
-When `API_KEY` is non-empty, middleware protects paths beginning with `/v1/` using a bearer
-token comparison. `/health` and OpenAPI docs are outside that middleware check. External
+When `API_KEY` is non-empty, middleware protects paths beginning with `/v1/` by comparing the
+Authorization header with the configured key after removing an optional `Bearer ` prefix.
+`/health` and OpenAPI docs are outside that middleware check. External
 service failures are generally logged and translated to HTTP errors; collection schema
 mismatch is returned as a conflict during collection initialization.
 
@@ -285,7 +348,7 @@ The main endpoint groups are:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Process health response |
-| `POST /v1/retrieve` | Return ranked passages and warnings without answer generation |
+| `POST /v1/retrieve` | Return ranked parent contexts under `passages`, plus warnings, without answer generation |
 | `POST /v1/rag` | Retrieve, rerank, and generate a grounded answer |
 | `POST /v1/collections/initialize` | Create or validate collection; optional recreation |
 | `POST /v1/ingest/document` | Ingest one supplied document |
@@ -302,6 +365,8 @@ recorded after Qdrant ingestion succeeds, and revision readiness is managed insi
 
 ## Benchmark and evaluation architecture
 
+### Answer generation and local evaluation
+
 `benchmark.py` reads JSONL questions and sends each unprocessed question through `RagService`.
 It appends results with answers, contexts, source records, warnings, and the gold answer to
 the configured dataset file. It skips question IDs already present in the output and writes
@@ -314,7 +379,7 @@ and reference strings and a non-empty string context list. Prompts execute seque
 malformed output gets one correction retry. A failure aborts the record without returning
 partial scores. Relevancy and correctness additionally request dense vectors through the
 hybrid embedding client. Exact formulas, prompt fields, and failure cases are specified in
-[ragas.md](../ragas.md).
+[ragas.md](ragas.md).
 
 `eval.py` tags rows with `ragas-0.4.3-prompts-json-parent-context-v3`. It deduplicates input/output by
 question ID, skips successful IDs, replaces errors on retry, and rewrites output through a
@@ -331,7 +396,10 @@ precision, target-document hit rate (any expected parent found), complete covera
 rank, cutoffs at 1/3/5 unique parent documents, and breakdowns by question/source type. Cutoff
 aggregates score the first up to k parents; short or empty result lists remain in the
 denominator as misses. Analysis writes numeric summaries and per-question details without calling models or checking implementation
-consistency.
+consistency. These deterministic document metrics are computed during analysis; `eval.py`
+adds the five judge/embedding scores and their status to saved answer records.
+
+### Retrieval diagnostics
 
 `scripts/multi_retrieval.py` is a separate diagnostic workflow: it reranks all fused child
 candidates, then saves deduplicated parent-document rankings before/after reranking,
@@ -339,6 +407,23 @@ expected-document ranks, target-document hit@5 flags, and a manifest. It neither
 `RERANK_TOP_N`. Its output is overwritten per invocation; reranking failures produce error
 rows instead of the normal RAG fallback. Its ranks use unique parent document IDs, matching
 the final-context analysis.
+
+### EnterpriseRAG-Bench evaluation
+
+This separate workflow uses saved answers and final source document IDs rather than invoking
+retrieval or generation again. `scripts/prepare_enterpriserag_answers.py` validates answer
+coverage against the question set, rejects duplicate question IDs, and writes
+`question_id`, `answer`, and deduplicated `document_ids` to the prepared JSONL. It does not
+depend on successful local RAGAS evaluation or call a model.
+
+`scripts/run_enterpriserag_eval.py` imports an external EnterpriseRAG-Bench checkout and
+adapts its LLM client to streaming OpenAI-compatible chat completions using Elite RAG's
+evaluation endpoint, key, and model settings. The benchmark checkout owns the scoring logic,
+prompts, result aggregation, and resume behavior. The runner forwards the question/answer
+paths, result path, concurrency, optional limit, and resume flag. It always enables
+`--no-correction` and `--skip-citation-stripping`; the document correction flow is therefore
+disabled. The benchmark writes its own JSON results, separate from the local evaluation
+JSONL and analysis outputs. See [ragbench.md](ragbench.md) for the workflow and interpretation.
 
 ## Configuration and service dependencies
 

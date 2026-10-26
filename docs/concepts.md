@@ -1,7 +1,7 @@
 # Concepts
 
 This page explains the active pipeline. See [architecture](architecture.md) for module and
-service boundaries, [operation](operation.md) for commands, and [the metric contract](../ragas.md)
+service boundaries, [operation](operation.md) for commands, and [the metric contract](ragas.md)
 for exact scoring behavior.
 
 ## Documents, sections, and passages
@@ -86,7 +86,12 @@ The response includes ordered `contexts`, aligned `sources` metadata, and warnin
 generation preserves those fields, copies the gold answer into `ground_truth`, and appends
 one record per new question ID. Existing output IDs determine resume.
 
-## Two kinds of evaluation
+## Elite RAG evaluation metrics
+
+The `scripts/eval.py` workflow produces two groups of metrics for Elite RAG's saved answers.
+The first group uses judge and embedding calls; the second compares retrieved parent document
+IDs with the benchmark labels. These are two metric groups within Elite RAG evaluation, not
+references to RAGAS and RAGBench.
 
 The five judge/embedding metrics use RAGAS 0.4.3 prompts and schemas through a local wrapper:
 
@@ -101,7 +106,7 @@ The five judge/embedding metrics use RAGAS 0.4.3 prompts and schemas through a l
 The wrapper executes prompts and formulas itself; it does not run the official metric
 classes. It validates record inputs and structured judge outputs, retries malformed output
 once per prompt, and fails the record on a metric error. Exact formulas and edge cases,
-including empty statements and zero vectors, are in [ragas.md](../ragas.md).
+including empty statements and zero vectors, are in [ragas.md](ragas.md).
 
 Deterministic document metrics compare benchmark `expected_doc_ids` with parent document IDs
 in the final saved sources. They report expected-document recall and precision, target-document
@@ -114,6 +119,18 @@ document may also provide useful evidence. Judge context recall does not check e
 and a low judge score is not proof of a document retrieval miss. Questions with no expected
 IDs are excluded from document metrics. For `info_not_found`, assess abstention separately
 because the reference may describe expected behavior rather than source facts.
+
+## EnterpriseRAG-Bench evaluation (RAGBench)
+
+EnterpriseRAG-Bench is a separate evaluator with its own prompts and score definitions. It is
+not part of `scripts/eval.py`, and its results are separate from the RAGAS-style and deterministic
+document metrics above. The RAGBench workflow prepares Elite RAG's saved answers and their final
+source document IDs, then sends them to the EnterpriseRAG-Bench evaluator using the configured
+judge. It reports answer correctness, completeness, and document recall, among other results.
+
+The workflow and commands are in [ragbench.md](ragbench.md). Use it to compare answers with
+EnterpriseRAG-Bench scoring; use Elite RAG's evaluator for the local RAGAS-prompt metrics and
+expected-parent retrieval metrics described above.
 
 ## Analysis and comparison
 
