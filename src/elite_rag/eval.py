@@ -1,4 +1,4 @@
-"""Score generated RAG answers with the five custom text-judge metrics."""
+"""Score generated answers with the five official RAGAS 0.4.3 metrics."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from elite_rag.config import Settings
-from elite_rag.evaluation import RagEvaluator
+from elite_rag.evaluation import EVALUATION_IMPLEMENTATION, EvaluationError, RagEvaluator
 
 
 def _records(path: Path) -> list[dict[str, Any]]:
@@ -26,6 +26,32 @@ def _records(path: Path) -> list[dict[str, Any]]:
     return result
 
 
+def _identifier(row: dict[str, Any], index: int) -> str:
+    return str(row.get("question_id", index))
+
+
+def _deduplicate(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    order: list[str] = []
+    unique: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        identifier = _identifier(row, index)
+        if identifier not in unique:
+            order.append(identifier)
+        unique[identifier] = {**row, "question_id": identifier}
+    return order, unique
+
+
+def _write_results(
+    destination: Path, order: list[str], records: dict[str, dict[str, Any]]
+) -> None:
+    temporary = destination.with_name(destination.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for identifier in order:
+            handle.write(json.dumps(records[identifier], ensure_ascii=False) + "\n")
+        handle.flush()
+    temporary.replace(destination)
+
+
 def run_evaluation(
     settings: Settings,
     *,
@@ -37,30 +63,70 @@ def run_evaluation(
     destination = Path(output_path or settings.eval_output_file)
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows = _records(source)
-    completed: set[str] = set()
+    input_order, rows_by_id = _deduplicate(rows)
+    rows = [rows_by_id[identifier] for identifier in input_order]
+    output_order: list[str] = []
+    output_by_id: dict[str, dict[str, Any]] = {}
     if destination.exists():
-        for row in _records(destination):
-            if row.get("evaluation_status") == "ok" and isinstance(row.get("question_id"), str):
-                completed.add(row["question_id"])
+        previous_rows = _records(destination)
+        for index, row in enumerate(previous_rows):
+            if (
+                row.get("evaluation_status") == "ok"
+                and row.get("evaluation_implementation") != EVALUATION_IMPLEMENTATION
+            ):
+                raise ValueError(
+                    f"{destination} contains a different evaluation implementation. "
+                    "Use --output with a new file to keep the evaluations separate."
+                )
+            identifier = _identifier(row, index)
+            if identifier not in output_by_id:
+                output_order.append(identifier)
+            output_by_id[identifier] = {**row, "question_id": identifier}
+        if len(output_order) != len(previous_rows):
+            _write_results(destination, output_order, output_by_id)
+    completed = {
+        identifier
+        for identifier, row in output_by_id.items()
+        if row.get("evaluation_status") == "ok"
+    }
     evaluator = RagEvaluator(settings)
     count = 0
-    with destination.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            identifier = str(row.get("question_id", count))
-            if identifier in completed:
-                continue
-            if limit is not None and count >= limit:
-                break
-            result = dict(row)
-            try:
-                result.update(evaluator.evaluate(row))
-                result["evaluation_status"] = "ok"
-            except Exception as exc:
-                result["evaluation_status"] = "error"
-                result["evaluation_error"] = str(exc)
-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-            handle.flush()
-            count += 1
-            print(f"{identifier}: {result['evaluation_status']}")
+    for row in rows:
+        identifier = str(row["question_id"])
+        if identifier in completed:
+            continue
+        if limit is not None and count >= limit:
+            break
+        result = dict(row)
+        result["evaluation_implementation"] = EVALUATION_IMPLEMENTATION
+        for key in (
+            "evaluation_error",
+            "evaluation_stage",
+            "evaluation_raw_responses",
+            "evaluation_prompt_retries",
+        ):
+            result.pop(key, None)
+        try:
+            result.update(evaluator.evaluate(row))
+            result["evaluation_status"] = "ok"
+            completed.add(identifier)
+        except EvaluationError as exc:
+            result["evaluation_status"] = "error"
+            result["evaluation_error"] = str(exc)
+            result["evaluation_stage"] = exc.stage
+            if exc.raw_responses:
+                result["evaluation_raw_responses"] = exc.raw_responses
+        except Exception as exc:
+            result["evaluation_status"] = "error"
+            result["evaluation_stage"] = "unknown"
+            result["evaluation_error"] = str(exc)
+        if evaluator.prompt_retries:
+            result["evaluation_prompt_retries"] = evaluator.prompt_retries
+        if identifier not in output_by_id:
+            output_order.append(identifier)
+        output_by_id[identifier] = result
+        _write_results(destination, output_order, output_by_id)
+        count += 1
+        print(f"{identifier}: {result['evaluation_status']}")
     print(f"Evaluated {count} records; metrics: {destination}")
     return 0

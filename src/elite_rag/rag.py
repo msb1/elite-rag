@@ -116,7 +116,7 @@ class TriVectorRetriever:
                 **payload,
                 "passage_id": str(payload.get("passage_id") or hit.id),
                 "document_id": str(
-                    payload.get("document_id") or payload.get("parent_document_id") or ""
+                    payload.get("parent_document_id") or payload.get("document_id") or ""
                 ),
                 "rank": rank,
                 "score": float(hit.score or 0.0),
@@ -148,7 +148,129 @@ class RagService:
             LOGGER.exception("bge_reranking_failed")
             warnings.append(f"BGE reranking failed; retaining RRF order: {exc}")
             ranked = candidates
-        return ranked[: self.settings.rerank_top_n], warnings
+        parents, expansion_warnings = self.expand_to_parent_documents(
+            ranked, max_parents=self.settings.rerank_top_n
+        )
+        warnings.extend(expansion_warnings)
+        return parents, warnings
+
+    @staticmethod
+    def expand_to_parent_documents(
+        children: Sequence[dict[str, Any]],
+        *,
+        max_parents: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Map reranked child passages to deduplicated parent-document contexts."""
+        parents: dict[str, dict[str, Any]] = {}
+        section_texts: dict[str, dict[str, tuple[int, str]]] = {}
+        warnings: list[str] = []
+        for fallback_rank, child in enumerate(children, start=1):
+            document_id = str(
+                child.get("parent_document_id") or child.get("document_id") or ""
+            ).strip()
+            if not document_id:
+                warnings.append(
+                    f"Skipping retrieved passage {child.get('passage_id', '<unknown>')}: "
+                    "parent document ID is missing"
+                )
+                continue
+
+            if document_id not in parents and max_parents is not None and len(parents) >= max_parents:
+                break
+
+            parent = parents.get(document_id)
+            if parent is None:
+                parent = {
+                    **{
+                        key: value
+                        for key, value in child.items()
+                        if key not in {"document_full_text", "section_text"}
+                    },
+                    "document_id": document_id,
+                    "parent_document_id": document_id,
+                    "text": "",
+                    "matched_passage_ids": [],
+                    "matched_sections": [],
+                    "_parent_text": None,
+                }
+                parents[document_id] = parent
+                section_texts[document_id] = {}
+
+            passage_id = str(child.get("passage_id") or "").strip()
+            if passage_id and passage_id not in parent["matched_passage_ids"]:
+                parent["matched_passage_ids"].append(passage_id)
+            section_path = child.get("section_path")
+            if isinstance(section_path, list):
+                section_label = " > ".join(str(part) for part in section_path if part)
+                if section_label and section_label not in parent["matched_sections"]:
+                    parent["matched_sections"].append(section_label)
+
+            child_rank = child.get("rerank_rank", fallback_rank)
+            current_rank = parent.get("rerank_rank")
+            if current_rank is None or child_rank < current_rank:
+                parent["rerank_rank"] = child_rank
+                # Keep provenance for the highest-ranked child hit for this parent.
+                for key in ("passage_id", "title", "section_name", "section_path", "source"):
+                    if key in child:
+                        parent[key] = child[key]
+            score = child.get("rerank_score")
+            if isinstance(score, (int, float)):
+                previous = parent.get("rerank_score")
+                if previous is None or score > previous:
+                    parent["rerank_score"] = float(score)
+
+            full_text = child.get("document_full_text")
+            if isinstance(full_text, str) and full_text.strip():
+                parent["_parent_text"] = full_text.strip()
+            else:
+                section_text = child.get("section_text")
+                if isinstance(section_text, str) and section_text.strip():
+                    section_id = str(
+                        child.get("section_id") or child.get("section_index") or passage_id
+                    )
+                    section_index = child.get("section_index")
+                    order = (
+                        section_index
+                        if isinstance(section_index, int)
+                        else len(section_texts[document_id])
+                    )
+                    section_texts[document_id].setdefault(section_id, (order, section_text.strip()))
+                elif isinstance(child.get("text"), str) and child["text"].strip():
+                    section_id = passage_id or str(len(section_texts[document_id]))
+                    section_texts[document_id].setdefault(
+                        section_id, (len(section_texts[document_id]), child["text"].strip())
+                    )
+
+        result = []
+        for document_id, parent in parents.items():
+            parent_text = parent.pop("_parent_text")
+            if not parent_text:
+                parent_text = "\n\n".join(
+                    text
+                    for _, text in sorted(
+                        section_texts[document_id].values(), key=lambda item: item[0]
+                    )
+                )
+                warnings.append(
+                    f"Parent document {document_id} has no stored full text; "
+                    "using retrieved section context"
+                )
+            if not parent_text:
+                warnings.append(
+                    f"Skipping parent document {document_id}: no context text is available"
+                )
+                continue
+            breadcrumbs = []
+            if parent.get("title"):
+                breadcrumbs.append(f"Title: {parent['title']}")
+            if parent.get("source"):
+                breadcrumbs.append(f"Source: {parent['source']}")
+            if parent.get("matched_sections"):
+                breadcrumbs.append("Matched sections: " + "; ".join(parent["matched_sections"]))
+            breadcrumbs.append("Parent document text:\n" + parent_text)
+            parent["text"] = "\n".join(breadcrumbs)
+            result.append(parent)
+        return result, warnings
 
     def rerank(
         self, question: str, candidates: Sequence[dict[str, Any]]
@@ -232,7 +354,10 @@ class RagService:
             "sources": [
                 {
                     "passage_id": item["passage_id"],
+                    "matched_passage_ids": item.get("matched_passage_ids", []),
+                    "matched_sections": item.get("matched_sections", []),
                     "document_id": item["document_id"],
+                    "parent_document_id": item.get("parent_document_id", item["document_id"]),
                     "title": item.get("title"),
                     "section_name": item.get("section_name"),
                     "section_path": item.get("section_path"),

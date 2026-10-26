@@ -1,15 +1,76 @@
-"""Custom RAGAS-style text judge metrics ported from the Python RAG benchmark."""
+"""Use RAGAS 0.4.3 prompts and scoring with the configured text endpoints."""
 
 from __future__ import annotations
 
+import math
 import json
-import re
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeVar
 
 from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+from ragas.metrics.collections.answer_correctness.util import (
+    ClassificationWithReason,
+    CorrectnessClassifierInput,
+    CorrectnessClassifierPrompt,
+)
+from ragas.metrics.collections.answer_correctness.util import (
+    StatementGeneratorInput as CorrectnessStatementInput,
+)
+from ragas.metrics.collections.answer_correctness.util import (
+    StatementGeneratorOutput as CorrectnessStatementOutput,
+)
+from ragas.metrics.collections.answer_correctness.util import (
+    StatementGeneratorPrompt as CorrectnessStatementPrompt,
+)
+from ragas.metrics.collections.answer_relevancy.util import (
+    AnswerRelevanceInput,
+    AnswerRelevanceOutput,
+    AnswerRelevancePrompt,
+)
+from ragas.metrics.collections.context_precision.util import (
+    ContextPrecisionInput,
+    ContextPrecisionOutput,
+    ContextPrecisionPrompt,
+)
+from ragas.metrics.collections.context_recall.util import (
+    ContextRecallInput,
+    ContextRecallOutput,
+    ContextRecallPrompt,
+)
+from ragas.metrics.collections.faithfulness.util import (
+    NLIStatementInput,
+    NLIStatementOutput,
+    NLIStatementPrompt,
+    StatementGeneratorInput,
+    StatementGeneratorOutput,
+    StatementGeneratorPrompt,
+)
 
 from elite_rag.config import Settings
+from elite_rag.embedding import HybridEmbedder
+
+EVALUATION_IMPLEMENTATION = "ragas-0.4.3-prompts-json-parent-context-v3"
+JUDGE_SYSTEM_PROMPT = (
+    "Follow the user's evaluation instructions exactly. Return only one valid JSON object "
+    "matching the requested response schema. Populate the schema's fields with the result; "
+    "do not return the schema definition, markdown, or any extra text."
+)
+Output = TypeVar("Output", bound=BaseModel)
+
+
+class EvaluationError(ValueError):
+    """An evaluation failure annotated with its metric stage and judge output."""
+
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        raw_responses: Sequence[str] = (),
+    ) -> None:
+        super().__init__(f"{stage}: {message}")
+        self.stage = stage
+        self.raw_responses = list(raw_responses)
 
 
 def format_context_list(contexts: Sequence[str]) -> str:
@@ -27,143 +88,270 @@ class RagEvaluator:
             api_key=settings.eval_api_key,
             timeout=180,
         )
+        self.embedder = HybridEmbedder(
+            settings.embedding_model,
+            settings.embedding_dimension,
+            settings.embedding_base_url,
+            settings.embedding_api_key,
+        )
+        self.prompt_retries: list[dict[str, Any]] = []
 
     def ask(self, prompt: str) -> str:
         response = self.client.chat.completions.create(
             model=self.settings.eval_model,
             temperature=0,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
         )
         return (response.choices[0].message.content or "").strip()
 
-    def _claims(self, answer: str) -> list[str]:
-        text = self.ask(
-            "Analyze the answer and list its independent factual claims, one per line. "
-            "Do not infer or add claims. Return only the list.\n\nAnswer:\n" + answer
-        )
-        return [
-            re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-            for line in text.splitlines()
-            if line.strip()
-        ]
-
-    def _facts(self, ground_truth: str) -> list[str]:
-        text = self.ask(
-            "Break the ground truth into independent factual statements, one per line. "
-            "Return only the list.\n\nGround truth:\n" + ground_truth
-        )
-        return [
-            re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-            for line in text.splitlines()
-            if line.strip()
-        ]
-
     @staticmethod
-    def _yes(value: str) -> bool:
-        normalized = value.strip().upper()
-        return normalized == "YES" or normalized.startswith("YES.")
+    def _parse_output(raw: str, output: type[Output]) -> Output:
+        """Find and validate a JSON object, allowing surrounding prose or code fences."""
+        decoder = json.JSONDecoder()
+        errors: list[str] = []
+        for index, character in enumerate(raw):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(raw, index)
+            except json.JSONDecodeError:
+                continue
+            try:
+                return output.model_validate(candidate)
+            except ValidationError as exc:
+                errors.append(str(exc))
+        if errors:
+            raise ValueError("JSON objects did not match the expected output model: " + errors[-1])
+        raise ValueError("response contained no valid JSON object")
 
-    def faithfulness(self, context: str, answer: str) -> float:
-        claims = self._claims(answer)
-        if not claims:
-            return 0.0
-        supported = sum(
-            self._yes(self.ask(
-                "Can this claim be supported using only the provided context? "
-                "Respond exactly YES or NO.\n\n"
-                f"Context:\n{context}\n\nClaim:\n{claim}"
-            ))
-            for claim in claims
-        )
-        return supported / len(claims)
+    def _prompt(
+        self,
+        prompt: Any,
+        data: BaseModel,
+        output: type[Output],
+        *,
+        stage: str,
+    ) -> Output:
+        prompt_text = prompt.to_string(data)
+        raw_responses: list[str] = []
+        try:
+            raw = self.ask(prompt_text)
+        except Exception as exc:
+            raise EvaluationError(stage, f"judge request failed: {exc}") from exc
+        raw_responses.append(raw)
+        try:
+            return self._parse_output(raw, output)
+        except (ValueError, ValidationError) as first_error:
+            first_error_text = str(first_error)
+            self.prompt_retries.append(
+                {
+                    "stage": stage,
+                    "attempt": 1,
+                    "validation_error": first_error_text,
+                    "raw_response": raw,
+                }
+            )
+            correction = (
+                "Your previous response did not contain a valid instance of the required "
+                "JSON output. Return only the populated JSON object matching the schema "
+                "already provided above. Do not repeat the schema definition. "
+                f"Validation issue: {first_error_text[:1000]}"
+            )
+
+        try:
+            retry_raw = self.ask(f"{prompt_text}\n\n{correction}")
+        except Exception as exc:
+            raise EvaluationError(
+                stage,
+                f"judge retry failed: {exc}",
+                raw_responses,
+            ) from exc
+        raw_responses.append(retry_raw)
+        try:
+            return self._parse_output(retry_raw, output)
+        except (ValueError, ValidationError) as exc:
+            raise EvaluationError(
+                stage,
+                f"invalid {output.__name__} response after one correction retry: {exc}",
+                raw_responses,
+            ) from exc
+
+    def faithfulness(self, question: str, answer: str, contexts: list[str]) -> float:
+        statements = self._prompt(
+            StatementGeneratorPrompt(),
+            StatementGeneratorInput(question=question, answer=answer),
+            StatementGeneratorOutput,
+            stage="faithfulness.statement_generation",
+        ).statements
+        if not statements:
+            return math.nan
+        verdicts = self._prompt(
+            NLIStatementPrompt(),
+            NLIStatementInput(context="\n".join(contexts), statements=statements),
+            NLIStatementOutput,
+            stage="faithfulness.verdicts",
+        ).statements
+        return sum(bool(item.verdict) for item in verdicts) / len(verdicts)
 
     def answer_relevancy(self, question: str, answer: str) -> float:
-        generated = self.ask(
-            "Generate the specific concise question this answer resolves. "
-            "Return only the question.\n\nAnswer:\n" + answer
-        )
-        result = self.ask(
-            "Compare the semantic intent of the two questions. Return only a number from "
-            "0.0 to 1.0.\n\n"
-            f"Original question: {question}\nGenerated question: {generated}"
-        )
-        return self._score(result)
-
-    def answer_correctness(self, answer: str, ground_truth: str) -> float:
-        prompt = (
-            "Compare the generated answer with the ground truth. Return strict JSON with "
-            "arrays TP (facts in both), FP (facts in answer but unsupported or conflicting), "
-            "and FN (facts in ground truth missed by the answer).\n\n"
-            f"Generated answer:\n{answer}\n\nGround truth:\n{ground_truth}"
-        )
-        raw = self.ask(prompt)
-        try:
-            start, end = raw.find("{"), raw.rfind("}")
-            data = json.loads(raw[start : end + 1])
-            tp, fp, fn = (len(data.get(key, [])) for key in ("TP", "FP", "FN"))
-            denominator = tp + 0.5 * (fp + fn)
-            return tp / denominator if denominator else 0.0
-        except (ValueError, TypeError, json.JSONDecodeError):
-            score = self._score(self.ask(
-                "Rate factual correctness against the ground truth from 0 to 1. "
-                "Return only a number.\n\n"
-                f"Ground truth:\n{ground_truth}\n\nGenerated answer:\n{answer}"
-            ))
-            return score
-
-    def context_recall(self, ground_truth: str, context: str) -> float:
-        facts = self._facts(ground_truth)
-        if not facts:
-            return 0.0
-        found = sum(
-            self._yes(self.ask(
-                "Can this fact be found or clearly deduced using only the provided context? "
-                "Respond exactly YES or NO.\n\n"
-                f"Context:\n{context}\n\nFact:\n{fact}"
-            ))
-            for fact in facts
-        )
-        return found / len(facts)
-
-    def context_precision(self, question: str, ground_truth: str, context: str) -> float:
-        sentences = [
-            part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", context) if part.strip()
+        generated = [
+            self._prompt(
+                AnswerRelevancePrompt(),
+                AnswerRelevanceInput(response=answer),
+                AnswerRelevanceOutput,
+                stage="answer_relevancy.question_generation",
+            )
+            for _ in range(3)
         ]
-        if not sentences:
+        questions = [item.question for item in generated if item.question]
+        if not questions:
             return 0.0
-        relevant = sum(
-            self._yes(self.ask(
-                "Is this context sentence useful for answering the question, given the "
-                "ground truth? Respond exactly YES or NO.\n\n"
-                f"Question: {question}\nGround truth: {ground_truth}\n"
-                f"Sentence: {sentence}"
-            ))
-            for sentence in sentences
-        )
-        return relevant / len(sentences)
+        try:
+            vectors = [item.dense for item in self.embedder.embed_queries([question, *questions])]
+        except Exception as exc:
+            raise EvaluationError("answer_relevancy.embeddings", str(exc)) from exc
+        original, candidates = vectors[0], vectors[1:]
+        norm_original = math.sqrt(sum(a * a for a in original))
+        similarities = []
+        for candidate in candidates:
+            norm_candidate = math.sqrt(sum(b * b for b in candidate))
+            similarities.append(
+                sum(a * b for a, b in zip(original, candidate, strict=True))
+                / (norm_original * norm_candidate)
+            )
+        score = sum(similarities) / len(similarities)
+        noncommittal = [item.noncommittal for item in generated if item.question]
+        return score * int(not all(noncommittal))
 
-    @staticmethod
-    def _score(value: str) -> float:
-        match = re.search(r"[-+]?(?:\d+\.?\d*|\.\d+)", value)
-        if not match:
-            return 0.0
-        score = float(match.group())
-        return min(1.0, max(0.0, score))
+    def context_recall(self, question: str, reference: str, contexts: list[str]) -> float:
+        result = self._prompt(
+            ContextRecallPrompt(),
+            ContextRecallInput(question=question, context="\n".join(contexts), answer=reference),
+            ContextRecallOutput,
+            stage="context_recall.classification",
+        )
+        verdicts = result.classifications
+        return (
+            sum(item.attributed for item in verdicts) / len(verdicts)
+            if verdicts
+            else math.nan
+        )
+
+    def context_precision(self, question: str, reference: str, contexts: list[str]) -> float:
+        prompt = ContextPrecisionPrompt()
+        verdicts = []
+        for index, context in enumerate(contexts, start=1):
+            result = self._prompt(
+                prompt,
+                ContextPrecisionInput(question=question, context=context, answer=reference),
+                ContextPrecisionOutput,
+                stage=f"context_precision.context_{index}.verdict",
+            )
+            verdicts.append(result.verdict)
+        relevant = 0
+        numerator = 0.0
+        for rank, verdict in enumerate(verdicts, 1):
+            relevant += verdict
+            numerator += (relevant / rank) * verdict
+        return numerator / (sum(verdicts) + 1e-10)
+
+    def answer_correctness(self, question: str, answer: str, reference: str) -> float:
+        prompt = CorrectnessStatementPrompt()
+        answer_statements = self._prompt(
+            prompt,
+            CorrectnessStatementInput(question=question, answer=answer),
+            CorrectnessStatementOutput,
+            stage="answer_correctness.answer_statement_generation",
+        ).statements
+        reference_statements = self._prompt(
+            prompt,
+            CorrectnessStatementInput(question=question, answer=reference),
+            CorrectnessStatementOutput,
+            stage="answer_correctness.reference_statement_generation",
+        ).statements
+        if answer_statements and reference_statements:
+            classified = self._prompt(
+                CorrectnessClassifierPrompt(),
+                CorrectnessClassifierInput(
+                    question=question,
+                    answer=answer_statements,
+                    ground_truth=reference_statements,
+                ),
+                ClassificationWithReason,
+                stage="answer_correctness.statement_classification",
+            )
+            tp, fp, fn = len(classified.TP), len(classified.FP), len(classified.FN)
+            precision = tp / (tp + fp) if tp + fp else (1.0 if not fn else 0.0)
+            recall = tp / (tp + fn) if tp + fn else (1.0 if not fp else 0.0)
+            factuality = (
+                2 * precision * recall / (precision + recall) if precision + recall else 0.0
+            )
+        else:
+            factuality = 1.0
+        try:
+            vectors = [item.dense for item in self.embedder.embed_documents([answer, reference])]
+        except Exception as exc:
+            raise EvaluationError("answer_correctness.embeddings", str(exc)) from exc
+        left, right = vectors
+        norm_left = math.sqrt(sum(a * a for a in left))
+        norm_right = math.sqrt(sum(b * b for b in right))
+        similarity = (
+            sum(a * b for a, b in zip(left, right, strict=True)) / (norm_left * norm_right)
+            if norm_left and norm_right
+            else 0.0
+        )
+        return 0.75 * factuality + 0.25 * similarity
 
     def evaluate(self, record: dict[str, Any]) -> dict[str, float]:
-        contexts = record.get("contexts", [])
-        if isinstance(contexts, str):
-            contexts = [contexts]
-        if not isinstance(contexts, list):
-            contexts = []
-        context = format_context_list([str(item) for item in contexts])
-        question = str(record.get("question", ""))
-        answer = str(record.get("answer", ""))
-        ground_truth = str(record.get("ground_truth", ""))
-        return {
-            "faithfulness": self.faithfulness(context, answer),
-            "answer_relevancy": self.answer_relevancy(question, answer),
-            "context_recall": self.context_recall(ground_truth, context),
-            "context_precision": self.context_precision(question, ground_truth, context),
-            "answer_correctness": self.answer_correctness(answer, ground_truth),
-        }
+        self.prompt_retries = []
+        question = record.get("question")
+        answer = record.get("answer")
+        reference = record.get("ground_truth")
+        contexts = record.get("contexts")
+        missing = [
+            name
+            for name, value in (
+                ("question", question),
+                ("answer", answer),
+                ("ground_truth", reference),
+            )
+            if not isinstance(value, str) or not value
+        ]
+        if missing:
+            raise EvaluationError(
+                "input_validation",
+                "required non-empty string field(s) missing or invalid: " + ", ".join(missing),
+            )
+        if not isinstance(contexts, list) or not contexts:
+            raise EvaluationError(
+                "input_validation", "contexts must be a non-empty list of strings"
+            )
+        if any(not isinstance(context, str) for context in contexts):
+            raise EvaluationError(
+                "input_validation", "contexts must contain only strings"
+            )
+        metrics = {}
+
+        def add(name: str, score: float) -> None:
+            if not math.isfinite(score):
+                raise ValueError(f"RAGAS {name} returned a nonfinite score")
+            metrics[name] = score
+
+        stages = (
+            ("faithfulness", lambda: self.faithfulness(question, answer, contexts)),
+            ("answer_relevancy", lambda: self.answer_relevancy(question, answer)),
+            ("context_recall", lambda: self.context_recall(question, reference, contexts)),
+            ("context_precision", lambda: self.context_precision(question, reference, contexts)),
+            ("answer_correctness", lambda: self.answer_correctness(question, answer, reference)),
+        )
+        for name, calculate in stages:
+            try:
+                add(name, calculate())
+            except EvaluationError:
+                raise
+            except Exception as exc:
+                raise EvaluationError(name, str(exc)) from exc
+        return metrics

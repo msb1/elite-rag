@@ -35,12 +35,13 @@ def ranked_documents(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     seen: set[str] = set()
     for chunk in chunks:
-        document_id = chunk.get("document_id")
+        document_id = chunk.get("parent_document_id") or chunk.get("document_id")
         if not document_id or document_id in seen:
             continue
         seen.add(document_id)
         result.append({
             "document_id": document_id,
+            "parent_document_id": document_id,
             "title": chunk.get("title"),
             "section_name": chunk.get("section_name"),
             "passage_id": chunk.get("passage_id"),
@@ -110,14 +111,22 @@ def main() -> int:
                     reranked = service.rerank(question, candidates) if candidates else []
                     qdrant_docs = ranked_documents(candidates)
                     reranked_docs = ranked_documents(reranked)
+                    qdrant_expected = expected_ranks(qdrant_docs, expected)
+                    reranked_expected = expected_ranks(reranked_docs, expected)
                     result = {
                         **row,
                         "collection": settings.qdrant_collection,
                         "retrieval_number": settings.retrieval_number,
                         "qdrant_candidate_count": len(candidates),
                         "reranker_candidate_count": len(candidates),
-                        "expected_document_ranks": expected_ranks(qdrant_docs, expected),
-                        "reranked_expected_document_ranks": expected_ranks(reranked_docs, expected),
+                        "expected_document_ranks": qdrant_expected,
+                        "reranked_expected_document_ranks": reranked_expected,
+                        "qdrant_target_doc_hit_at_5": any(
+                            rank <= 5 for rank in qdrant_expected.values()
+                        ),
+                        "reranked_target_doc_hit_at_5": any(
+                            rank <= 5 for rank in reranked_expected.values()
+                        ),
                         "qdrant_documents": qdrant_docs,
                         "reranked_documents": reranked_docs,
                         "retrieval_status": "ok",

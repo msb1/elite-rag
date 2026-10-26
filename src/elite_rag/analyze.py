@@ -9,6 +9,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from elite_rag.config import Settings
+from elite_rag.retrieval_metrics import document_retrieval, summarize_document_retrieval
 
 METRICS = (
     "faithfulness",
@@ -21,7 +22,16 @@ METRICS = (
 
 def _read(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        rows = [json.loads(line) for line in handle if line.strip()]
+    ordered_keys: list[tuple[str, str]] = []
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        identifier = row.get("question_id")
+        key = ("question", str(identifier)) if identifier is not None else ("line", str(index))
+        if key not in latest:
+            ordered_keys.append(key)
+        latest[key] = row
+    return [latest[key] for key in ordered_keys]
 
 
 def _write(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -33,8 +43,14 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def run_analysis(settings: Settings, *, input_path: str | None = None) -> dict[str, Any]:
     source = Path(input_path or settings.eval_output_file)
-    rows = [row for row in _read(source) if row.get("evaluation_status") == "ok"]
-    summary: dict[str, Any] = {"records": len(rows), "metrics": {}}
+    all_rows = [dict(row, document_retrieval=document_retrieval(row)) for row in _read(source)]
+    rows = [row for row in all_rows if row.get("evaluation_status") == "ok"]
+    summary: dict[str, Any] = {
+        "records": len(rows),
+        "input_records": len(all_rows),
+        "metrics": {},
+        "document_retrieval": summarize_document_retrieval(all_rows),
+    }
     for metric in METRICS:
         values = [row[metric] for row in rows if isinstance(row.get(metric), (int, float))]
         summary["metrics"][metric] = {
@@ -52,6 +68,28 @@ def run_analysis(settings: Settings, *, input_path: str | None = None) -> dict[s
     summary["retrieval_misses"] = len(misses)
     output = Path(settings.analysis_output_file)
     output.parent.mkdir(parents=True, exist_ok=True)
+    retrieval_output = output.with_name(output.stem + "_document_retrieval.jsonl")
+    _write(
+        retrieval_output,
+        [
+            {
+                key: row[key]
+                for key in (
+                    "question_id",
+                    "question",
+                    "question_type",
+                    "source_types",
+                    "evaluation_status",
+                    "context_recall",
+                    "context_precision",
+                    "document_retrieval",
+                )
+                if key in row
+            }
+            for row in all_rows
+        ],
+    )
+    summary["document_retrieval_output"] = str(retrieval_output)
     output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     _write_dashboard(Path(settings.dashboard_output_file), summary["metrics"])
     for metric, stats in summary["metrics"].items():
@@ -59,6 +97,26 @@ def run_analysis(settings: Settings, *, input_path: str | None = None) -> dict[s
         print(f"{metric}: mean={mean} (n={stats['count']})")
     print(f"Faithfulness < 0.30: {len(hallucinations)}")
     print(f"Context recall < 0.30: {len(misses)}")
+    retrieval = summary["document_retrieval"]
+    print(f"Document retrieval (n={retrieval['count']}, independent of judge status):")
+    for name in (
+        "target_doc_hit_rate",
+        "document_recall",
+        "document_precision",
+        "all_expected_found",
+        "reciprocal_rank",
+    ):
+        value = retrieval[name]
+        print(f"  {name}: {value:.3f}" if value is not None else f"  {name}: n/a")
+    hit_at_five = retrieval["at_k"]["5"]
+    hit_at_five_value = hit_at_five["target_doc_hit_rate"]
+    hit_at_five_mean = (
+        f"{hit_at_five_value:.3f}" if hit_at_five_value is not None else "n/a"
+    )
+    print(f"  target_doc_hit_rate@5: {hit_at_five_mean} (n={hit_at_five['count']})")
+    print(f"  No expected document found: {retrieval['no_expected_found']}")
+    print(f"  No expected documents (excluded): {retrieval['no_expected_documents']}")
+    print(f"Document retrieval details: {retrieval_output}")
     print(f"Analysis: {output}")
     return summary
 
@@ -82,8 +140,7 @@ def _write_dashboard(path: Path, metrics: dict[str, dict[str, Any]]) -> None:
             f'fill="#1f2937">{escape(name.replace("_", " ").title())}</text>'
         )
         items.append(
-            f'<rect x="{left}" y="{y}" width="{bar_width}" height="30" rx="5" '
-            'fill="#e5e7eb"/>'
+            f'<rect x="{left}" y="{y}" width="{bar_width}" height="30" rx="5" fill="#e5e7eb"/>'
         )
         if value is not None:
             items.append(

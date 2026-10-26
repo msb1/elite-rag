@@ -6,7 +6,9 @@ retrieval and passage store. RustFS is the object source for batch ingestion. Mo
 runs through separately configured embedding, reranking, answer, and evaluation endpoints.
 
 This document describes the implementation in `src/elite_rag` and the batch utilities in
-`scripts`. The high-level flow is:
+`scripts`. The commands are documented in [operation.md](operation.md), the terms in
+[concepts.md](concepts.md), and exact metric behavior in [../ragas.md](../ragas.md).
+The high-level flow is:
 
 ```mermaid
 flowchart LR
@@ -52,14 +54,14 @@ flowchart LR
     API --> EVAL
     CLI --> EVAL
     EVAL <--> JUDGE
+    EVAL --> EMB
     EVAL --> Files[JSONL and analysis artifacts]
 ```
 
 The diagram groups modules by responsibility. The API and CLI are entry points; they use the
-same ingestion and RAG services where applicable. RustFS prefix ingestion is the only path
-that lists a collection of objects. Direct API ingestion accepts one document payload, while
-`scripts/ingest_multi.py` performs an independent sequential batch over configured source
-folders.
+same ingestion and RAG services where applicable. The API prefix-ingestion job and batch ingestion script list RustFS objects. Direct API
+ingestion accepts one document payload, while `scripts/ingest_multi.py` performs an
+independent sequential batch over configured source folders.
 
 ## Runtime components
 
@@ -75,7 +77,7 @@ folders.
 | Ingestion orchestration | `ingestion.py` | Batch embedding, passage upserts, verification, readiness commit, and replacement cleanup |
 | Prefix job control | `jobs.py` | Queue, process, persist, resume, and report API RustFS prefix jobs |
 | Retrieval and answer | `rag.py` | Three-channel search, RRF, BGE reranking, context assembly, and grounded answer generation |
-| Quality workflow | `benchmark.py`, `evaluation.py`, `eval.py`, `analyze.py` | Run benchmark questions, ask judge model for scores, summarize results, and export failure rows |
+| Quality workflow | `benchmark.py`, `evaluation.py`, `eval.py`, `retrieval_metrics.py`, `analyze.py` | Run benchmark questions, ask judge model for scores, summarize results, and export failure rows |
 | Command line | `cli.py`, `scripts/` | Start the API and run RAG, benchmark, evaluation, analysis, ingestion, and retrieval utilities |
 
 The package's `PassageStore` contains reusable Qdrant collection and revision operations.
@@ -106,20 +108,23 @@ code. It can split common source labels such as Jira's “Steps to reproduce” 
 “Testing” into additional section levels. Each section is represented by a field name, path,
 and text.
 
-The hierarchical chunker operates within sections to avoid crossing heading boundaries. It
-uses the configured tokenizer and the multi-ingestion body limit; long paragraphs or
-sentences are split further, while code fences are kept as blocks until they must be divided.
+The hierarchical chunker operates within sections to avoid crossing heading boundaries.
+`MULTI_CHUNK_MAX_TOKENS` caps bodies (default 300); the body target is the maximum minus
+effective overlap (default 260), with a minimum of 64. `BGE_EMBEDDING_MAX_LENGTH` caps
+enriched embedding text (default 1024). Generic `CHUNK_TARGET_TOKENS` and `CHUNK_MAX_TOKENS`
+are not this splitter's active body budgets. It uses the configured tokenizer; long
+paragraphs or sentences are split further, while code fences are kept as blocks until they must be divided.
 Passages may include a tail overlap from the previous passage in the same section. The
 embedding text adds source and available entity context (for example project, repository,
 issue, or space), title, and section path before the passage body. The original body remains
 available separately for search payload and answer context.
 
-Each passage contains a deterministic point ID, document ID, ordinal, field and section
-identity, parsed-section offsets where recoverable, token count, and metadata. Metadata
+Each child passage contains a deterministic point ID, parent document ID, ordinal, field and
+section identity, parsed-section offsets where recoverable, token count, and metadata. Metadata
 includes a content revision, pipeline signature, source and normalized entity attributes,
-source metadata, and section evidence. The passage is one Qdrant point; there is no separate
-parent-vector collection. The payload may retain full document text for source records whose
-content fields are plain strings.
+source metadata, and section evidence. The child is one Qdrant point; parent documents are
+not separately vector-indexed. Payloads retain the parent document text when source fields are
+plain strings, plus the full parsed section text for fallback context expansion.
 
 ### Vector generation and collection schema
 
@@ -139,7 +144,7 @@ The names above are defaults. `multi_settings()` requires all three names to be 
 distinct, requires the BGE-M3 configuration, and requires the BM25 model to be
 `Qdrant/bm25`. On collection creation, the store creates payload indexes for document ID,
 source, project ID, revision, field name, section ID, and readiness. On reuse, it validates
-the dense and sparse vector sizes, distance, and modifiers; incompatible schemas fail with a
+the dense size/distance, sparse vector presence, and modifiers; incompatible schemas fail with a
 collection schema error.
 
 ### Revision commit protocol
@@ -182,7 +187,9 @@ sequenceDiagram
 ```
 
 If an exception occurs before commit, the new points remain not ready and are excluded from
-retrieval. A subsequent ingestion attempt can upsert the same deterministic IDs and retry.
+retrieval. Publication is not an atomic revision swap: new and old ready revisions may
+coexist briefly before cleanup. A subsequent ingestion attempt can upsert the same
+deterministic IDs and retry.
 An unchanged revision is skipped only when the expected count of ready points is present. An
 empty parsed document deletes all points with that document ID. `replace_existing` is passed
 through as report and job behavior; actual passage replacement is governed by revision
@@ -212,17 +219,20 @@ sparse, and BM25 with the original question text. All three are filtered to
 `ingestion_ready=true`. Qdrant combines their ranked candidates with reciprocal rank fusion
 (RRF) and returns up to `RETRIEVAL_NUMBER` fused results.
 
-`RagService` passes the original question and each candidate's title, section path, and text
-to the BGE reranking endpoint. A valid reranker response must rank every candidate exactly
-once. Results are cut to `RERANK_TOP_N`. If the reranker request or response validation fails,
-the service adds a warning and uses the Qdrant fused ordering. No query expansion or query
-rewriting is performed.
+`RagService` passes the original question and each child candidate's title, section path, and
+text to the BGE reranking endpoint. A valid reranker response must rank every candidate exactly
+once. The service maps ranked child hits to parent documents by parent document ID, deduplicates
+parents in first-hit order, and applies `RERANK_TOP_N` to unique parents. It expands each parent
+to its stored full text; if that text is unavailable, it uses retrieved section context and
+adds a warning. If reranking fails, it applies the same parent expansion and cutoff to the
+Qdrant fused order. No query expansion or query rewriting is performed.
 
-The answer request includes the system instruction, retrieved passage bodies, and original
-question. The model is instructed to use only explicit context facts and return the fixed
-no-answer text when context is insufficient. The response returns the answer, contexts,
-passage/document/source metadata, rerank scores, and warnings. When retrieval returns no
-passages, the fixed no-answer response is returned without calling the answer model.
+The answer request includes the system instruction, deduplicated parent-document texts, and
+original question. Thus `RERANK_TOP_N=5` means at most five unique parent contexts reach
+generation, even when several high-ranking child hits belong to the same parent. The response returns the answer, parent
+contexts, parent document IDs, matched child passage IDs/sections, rerank scores, and warnings.
+When no valid parent context remains, the fixed no-answer response is returned without calling
+the answer model.
 
 ```mermaid
 sequenceDiagram
@@ -249,7 +259,7 @@ sequenceDiagram
         Note over RAG: Keep RRF order and add warning
     end
     alt at least one passage
-        RAG->>Answer: system prompt + selected contexts + question
+        RAG->>Answer: system prompt + deduplicated parent texts + question
         Answer-->>RAG: grounded answer
     else no passages
         RAG->>RAG: return fixed no-answer text
@@ -297,11 +307,38 @@ It appends results with answers, contexts, source records, warnings, and the gol
 the configured dataset file. It skips question IDs already present in the output and writes
 a progress marker after each completed question.
 
-`evaluation.py` implements five custom LLM-judged metrics: faithfulness, answer relevancy,
-context recall, context precision, and answer correctness. `eval.py` appends per-record metric
-results and skips records already marked successful. `analyze.py` summarizes valid scores,
-writes a dashboard SVG, and exports records with faithfulness below 0.30 or context recall
-below 0.30. The judge results are model estimates, not deterministic verification.
+`evaluation.py` uses imported RAGAS 0.4.3 prompt classes and Pydantic output schemas,
+but executes ordinary chat completions and calculates the five metrics locally. It does not
+execute the official metric classes. Record validation requires non-empty question, answer,
+and reference strings and a non-empty string context list. Prompts execute sequentially;
+malformed output gets one correction retry. A failure aborts the record without returning
+partial scores. Relevancy and correctness additionally request dense vectors through the
+hybrid embedding client. Exact formulas, prompt fields, and failure cases are specified in
+[ragas.md](../ragas.md).
+
+`eval.py` tags rows with `ragas-0.4.3-prompts-json-parent-context-v3`. It deduplicates input/output by
+question ID, skips successful IDs, replaces errors on retry, and rewrites output through a
+temporary file after each attempt. A successful preexisting row from a different implementation
+rejects the destination. The batch return code is 0 even if individual rows failed; consumers
+must inspect `evaluation_status`. ID-based resume does not detect changed answers or models.
+
+`analyze.py` retains the latest row per question ID and summarizes successful judge scores,
+writes a mean-score dashboard SVG, and exports successful records below the strict 0.30
+faithfulness/context-recall thresholds. These exports are review lists, not verified failures.
+`retrieval_metrics.py` independently computes expected parent-document ID coverage over final
+saved sources, including judge-error rows with valid labels and IDs. It reports recall,
+precision, target-document hit rate (any expected parent found), complete coverage, reciprocal
+rank, cutoffs at 1/3/5 unique parent documents, and breakdowns by question/source type. Cutoff
+aggregates score the first up to k parents; short or empty result lists remain in the
+denominator as misses. Analysis writes numeric summaries and per-question details without calling models or checking implementation
+consistency.
+
+`scripts/multi_retrieval.py` is a separate diagnostic workflow: it reranks all fused child
+candidates, then saves deduplicated parent-document rankings before/after reranking,
+expected-document ranks, target-document hit@5 flags, and a manifest. It neither generates answers nor applies
+`RERANK_TOP_N`. Its output is overwritten per invocation; reranking failures produce error
+rows instead of the normal RAG fallback. Its ranks use unique parent document IDs, matching
+the final-context analysis.
 
 ## Configuration and service dependencies
 
@@ -313,11 +350,11 @@ are:
 | --- | --- | --- |
 | Qdrant | Collection, passage payloads, vector search, RRF, BM25 inference | `QDRANT_URL`, optional API key, collection and vector names |
 | RustFS / S3 | Source object listing and reads | Endpoint, access key, secret, region, bucket, and prefix |
-| BGE-M3 endpoint | Dense and learned sparse embeddings for passages and queries | Embedding base URL, model, dimension, and API key |
-| BGE reranker | Candidate ordering against the question | `BGE_RERANK_URL`, timeout, model settings |
+| BGE-M3 endpoint | Dense and learned sparse retrieval embeddings; dense evaluation embeddings for relevancy and correctness | Embedding base URL, model, dimension, and API key |
+| BGE reranker | Candidate ordering against the question | `BGE_RERANK_URL`, timeout; model and max length are configured on the model service |
 | Answer model | Final grounded answer | OpenAI-compatible base URL, model, temperature, token limit, API key |
 | Evaluation judge | Benchmark metric judgments | Judge base URL, model, and API key |
 | PostgreSQL (optional) | Durable API job state and object ETag tracking | `INGESTION_DATABASE_URL` |
 
-The model implementations are external to this package; this repository configures their
-clients. The defaults and operating procedures are maintained in [operation.md](operation.md).
+BGE inference is implemented in the separately deployed `remotes/remote-models.py`; the
+answer and judge model endpoints are external services. The defaults and operating procedures are maintained in [operation.md](operation.md).
