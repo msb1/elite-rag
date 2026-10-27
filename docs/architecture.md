@@ -381,7 +381,7 @@ partial scores. Relevancy and correctness additionally request dense vectors thr
 hybrid embedding client. Exact formulas, prompt fields, and failure cases are specified in
 [ragas.md](ragas.md).
 
-`eval.py` tags rows with `ragas-0.4.3-prompts-json-parent-context-v3`. It deduplicates input/output by
+`eval.py` tags rows with `ragas-0.4.3-prompts-json-parent-context-v4-structured-output`. It deduplicates input/output by
 question ID, skips successful IDs, replaces errors on retry, and rewrites output through a
 temporary file after each attempt. A successful preexisting row from a different implementation
 rejects the destination. The batch return code is 0 even if individual rows failed; consumers

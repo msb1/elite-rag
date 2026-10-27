@@ -138,7 +138,7 @@ Relevancy and correctness also use the configured BGE dense embeddings. This is 
 wrapper, not execution of the official metric classes. [ragas.md](docs/ragas.md) specifies its
 exact formulas and edge cases.
 
-The current implementation ID is `ragas-0.4.3-prompts-json-parent-context-v3`. Successful rows are
+The current implementation ID is `ragas-0.4.3-prompts-json-parent-context-v4-structured-output`. Successful rows are
 skipped; failed rows are retried and replaced. A successful row from another implementation
 causes rejection of that output file: choose a new filename. Malformed judge output gets one
 correction retry per prompt. Inspect `evaluation_status` and diagnostic fields: the batch

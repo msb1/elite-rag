@@ -20,3 +20,14 @@ Check evaluation statuses even if the command exits 0. Analysis output locations
 
 uv run python scripts/prepare_enterpriserag_answers.py
 uv run python scripts/run_enterpriserag_eval.py --parallelism 4 --no-correction --results-file results/enterpriserag_results.json
+
+uv run python -m elite_rag evaluate results_qwen.jsonl --metrics ragas
+uv run python -m elite_rag evaluate results_qwen.jsonl --metrics ragbench
+uv run python -m elite_rag evaluate result_gemma.jsonl --metrics ragas
+uv run python -m elite_rag evaluate result_gemma.jsonl --metrics ragbench
+
+
+uv run python scripts/eval.py --input results/results_qwen.jsonl --output results/ragas_qwen.jsonl
+uv run python scripts/run_enterpriserag_eval.py --answers-file results/results_qwen.jsonl --results-file results/ragbench_qwen.json
+uv run python scripts/eval.py --input results/results_gemma.jsonl --output results/ragas_gemma.jsonl
+uv run python scripts/run_enterpriserag_eval.py --answers-file results/results_gemma.jsonl --results-file results/ragbench_gemma.json

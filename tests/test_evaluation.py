@@ -137,7 +137,7 @@ SAMPLE = {
 
 
 @pytest.mark.parametrize("noncommittal", [0, 1])
-def test_ragas_prompts_and_scores_use_plain_chat_completions(evaluation_backend, noncommittal):
+def test_ragas_prompts_and_scores_use_strict_structured_outputs(evaluation_backend, noncommittal):
     evaluator, chat_requests, embedding_requests, outputs = evaluation_backend
     for output in outputs:
         if "noncommittal" in output:
@@ -156,7 +156,14 @@ def test_ragas_prompts_and_scores_use_plain_chat_completions(evaluation_backend,
     )
     assert not outputs
     assert len(chat_requests) == 12
-    assert all("response_format" not in request for request in chat_requests)
+    assert all(
+        request["response_format"]["type"] == "json_schema" for request in chat_requests
+    )
+    assert all(
+        request["response_format"]["json_schema"]["strict"] is True
+        for request in chat_requests
+    )
+    assert all("schema" in request["response_format"]["json_schema"] for request in chat_requests)
     assert all(request["model"] == "fixture-judge" for request in chat_requests)
     prompts = [request["messages"][-1]["content"] for request in chat_requests]
     for prompt, instruction in zip(

@@ -50,7 +50,7 @@ from ragas.metrics.collections.faithfulness.util import (
 from elite_rag.config import Settings
 from elite_rag.embedding import HybridEmbedder
 
-EVALUATION_IMPLEMENTATION = "ragas-0.4.3-prompts-json-parent-context-v3"
+EVALUATION_IMPLEMENTATION = "ragas-0.4.3-prompts-json-parent-context-v4-structured-output"
 JUDGE_SYSTEM_PROMPT = (
     "Follow the user's evaluation instructions exactly. Return only one valid JSON object "
     "matching the requested response schema. Populate the schema's fields with the result; "
@@ -96,10 +96,36 @@ class RagEvaluator:
         )
         self.prompt_retries: list[dict[str, Any]] = []
 
-    def ask(self, prompt: str) -> str:
+    @staticmethod
+    def _strict_json_schema(output: type[Output]) -> dict[str, Any]:
+        """Return an OpenAI Structured Outputs compatible schema for a Pydantic model."""
+        schema = output.model_json_schema()
+
+        def make_strict(node: Any) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    node["additionalProperties"] = False
+                for value in node.values():
+                    make_strict(value)
+            elif isinstance(node, list):
+                for value in node:
+                    make_strict(value)
+
+        make_strict(schema)
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": output.__name__,
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
+    def ask(self, prompt: str, output: type[Output]) -> str:
         response = self.client.chat.completions.create(
             model=self.settings.eval_model,
             temperature=0,
+            response_format=self._strict_json_schema(output),
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -138,9 +164,12 @@ class RagEvaluator:
         prompt_text = prompt.to_string(data)
         raw_responses: list[str] = []
         try:
-            raw = self.ask(prompt_text)
+            raw = self.ask(prompt_text, output)
         except Exception as exc:
-            raise EvaluationError(stage, f"judge request failed: {exc}") from exc
+            raise EvaluationError(
+                stage,
+                f"judge request failed with strict JSON Schema {output.__name__}: {exc}",
+            ) from exc
         raw_responses.append(raw)
         try:
             return self._parse_output(raw, output)
@@ -162,11 +191,11 @@ class RagEvaluator:
             )
 
         try:
-            retry_raw = self.ask(f"{prompt_text}\n\n{correction}")
+            retry_raw = self.ask(f"{prompt_text}\n\n{correction}", output)
         except Exception as exc:
             raise EvaluationError(
                 stage,
-                f"judge retry failed: {exc}",
+                f"judge retry failed with strict JSON Schema {output.__name__}: {exc}",
                 raw_responses,
             ) from exc
         raw_responses.append(retry_raw)

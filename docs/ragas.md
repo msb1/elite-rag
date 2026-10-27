@@ -7,7 +7,7 @@ This is the scoring contract of the current local implementation in
 [`pyproject.toml`](../pyproject.toml). The batch implementation ID is:
 
 ```text
-ragas-0.4.3-prompts-json-parent-context-v3
+ragas-0.4.3-prompts-json-parent-context-v4-structured-output
 ```
 
 Elite RAG imports RAGAS prompt classes, input models, and output schemas from
@@ -47,10 +47,15 @@ input through `to_string(data)`. `ask` adds this exact system message:
 Follow the user's evaluation instructions exactly. Return only one valid JSON object matching the requested response schema. Populate the schema's fields with the result; do not return the schema definition, markdown, or any extra text.
 ```
 
-Requests use `EVAL_MODEL`, temperature 0, the system message, and one user message. There is
-no `response_format` argument and no explicit judge `max_tokens`. The OpenAI client uses
-`EVAL_BASE_URL` (falling back to `OPENAI_LOCAL_ENDPOINT`), `EVAL_API_KEY`, and a 180-second
-timeout. SDK transport behavior is separate from the application correction retry.
+Requests use `EVAL_MODEL`, temperature 0, the system message, one user message, and strict
+Structured Outputs (`response_format.type=json_schema`). The JSON Schema is generated from the
+Pydantic output model for that specific RAGAS prompt; correction retries use the same schema.
+Every object in the schema disallows extra properties. The OpenAI client uses `EVAL_BASE_URL`
+(falling back to `OPENAI_LOCAL_ENDPOINT`), `EVAL_API_KEY`, and a 180-second timeout. The
+configured endpoint must support OpenAI Structured Outputs; unsupported schemas fail with a
+judge request error rather than silently falling back to unconstrained generation. Structured
+decoding constrains shape, while Pydantic validation and the correction retry remain in place
+for invalid or semantically inadequate results.
 
 The parser scans each opening `{` in the response, uses `JSONDecoder.raw_decode` to decode
 an object starting there, and returns the first candidate that validates against the RAGAS

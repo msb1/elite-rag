@@ -156,7 +156,7 @@ Evaluation requires only the saved answers, judge, and hybrid embedding service.
 RAGAS 0.4.3 prompts/schemas and calculates scores locally. See [ragas.md](ragas.md) for
 formulas, validation, and edge cases. `elite-rag eval` accepts the same flags.
 
-The implementation ID is `ragas-0.4.3-prompts-json-parent-context-v3`. The runner rejects an output
+The implementation ID is `ragas-0.4.3-prompts-json-parent-context-v4-structured-output`. The runner rejects an output
 containing any successful row with another/missing ID; use a new output for older results.
 It keeps the latest row per question ID, skips successful rows, and retries errors, replacing
 their rows via temporary-file rewrite after every attempt. `--limit` counts attempts.
